@@ -1,6 +1,16 @@
 # Meme Reply Selection Pipeline
 
-## Setup
+## Quick Start
+
+To view the pre-generated candidate meme pairings:
+
+```
+pip install flask
+python view_candidates_v2.py
+```
+Open `http://localhost:5001`
+
+## Full Pipeline Setup
 
 ```
 pip install requests numpy sentence-transformers flask python-dotenv
