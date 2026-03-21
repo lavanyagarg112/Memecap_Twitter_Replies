@@ -102,7 +102,8 @@ label {
     font-weight: 600;
 }
 
-input[type="text"] {
+input[type="text"],
+input[type="email"] {
     width: 100%;
     max-width: 300px;
     padding: 0.6rem 1rem;
@@ -114,8 +115,15 @@ input[type="text"] {
     transition: border-color 0.2s;
 }
 
-input[type="text"]:focus {
+input[type="text"]:focus,
+input[type="email"]:focus {
     border-color: #1a1a2e;
+}
+
+.email-note {
+    font-size: 0.75rem;
+    color: #999;
+    margin-bottom: 0.75rem;
 }
 
 /* ========================= */
@@ -148,14 +156,14 @@ input[type="text"]:focus {
     color: #fff;
 }
 
-.btn-funny {
+.btn-yes {
     background: #2ecc71;
     color: #fff;
     font-size: 1.15rem;
     padding: 1rem 2rem;
 }
 
-.btn-not-funny {
+.btn-no {
     background: #e74c3c;
     color: #fff;
     font-size: 1.15rem;
@@ -492,8 +500,8 @@ kbd {
         gap: 0.75rem;
     }
 
-    .btn-funny,
-    .btn-not-funny {
+    .btn-yes,
+    .btn-no {
         width: 100%;
     }
 

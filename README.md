@@ -88,8 +88,8 @@ python app.py
 ```
 Open `http://localhost:5000`
 
-- Annotators enter their name and start rating
+- Annotators enter their email and judge: "Would you use this meme as a reply to this tweet?"
 - Each meme-tweet pair needs 5 annotations
-- Annotators can stop anytime
+- Annotators can stop anytime (max 100 per person by default)
 - Admin dashboard at `/admin` (password required)
 - Export annotations as CSV from dashboard

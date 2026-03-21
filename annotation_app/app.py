@@ -21,6 +21,7 @@ import csv
 import io
 import json
 import os
+import random
 import sqlite3
 from pathlib import Path
 
@@ -53,6 +54,8 @@ DB_PATH = os.environ.get(
     str(Path(__file__).resolve().parent / "annotations.db"),
 )
 ANNOTATIONS_REQUIRED = 5  # per item
+MAX_PER_ANNOTATOR = int(os.environ.get("MAX_PER_ANNOTATOR", 100))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 1000))  # items per batch
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 if not ADMIN_PASSWORD:
     raise ValueError("Set ADMIN_PASSWORD in annotation_app/.env")
@@ -96,7 +99,7 @@ def init_db():
             selection_method TEXT NOT NULL,
             annotation_count INTEGER DEFAULT 0,
             skip_count INTEGER DEFAULT 0,
-            UNIQUE(task_id, candidate_index)
+            batch_num INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS annotations (
@@ -134,16 +137,21 @@ def init_db():
         data = json.load(f)
 
     tasks = data.get("tasks", [])
+    random.seed(42)
+    random.shuffle(tasks)
     inserted = 0
-    for task in tasks:
-        task_id = task["task_id"]
+    items_per_task = 10  # candidates per tweet
+    tasks_per_batch = BATCH_SIZE // items_per_task
+    for ti, task in enumerate(tasks):
+        task_id = f"{task['task_id']}_{ti}"
         tweet_text = task["tweet_text"]
+        batch_num = ti // tasks_per_batch + 1
         for ci, cand in enumerate(task["candidates"]):
             db.execute(
-                """INSERT OR IGNORE INTO items
+                """INSERT INTO items
                    (task_id, candidate_index, tweet_text, meme_post_id,
-                    image_url, meme_title, selection_method)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    image_url, meme_title, selection_method, batch_num)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     task_id,
                     ci,
@@ -152,12 +160,14 @@ def init_db():
                     cand["image_url"],
                     cand["title"],
                     cand["selection_method"],
+                    batch_num,
                 ),
             )
             inserted += 1
 
     db.commit()
-    print(f"Imported {inserted} annotation items from {len(tasks)} tasks.")
+    total_batches = (len(tasks) + tasks_per_batch - 1) // tasks_per_batch if tasks else 0
+    print(f"Imported {inserted} items from {len(tasks)} tasks into {total_batches} batches.")
     db.close()
 
 
@@ -196,18 +206,37 @@ def annotate():
     db = get_db()
     skipped_later = session.get("skipped_later", [])
 
-    # Get next item that still needs annotations.
-    # Stop showing an item if:
-    #   - it has 5+ real annotations (done), OR
-    #   - it has < 3 real annotations AND 5+ skips (likely broken image)
-    # Also skip items the user deferred this session.
-    query = """SELECT i.* FROM items i
+    # Count real annotations (not skips) for cap check
+    done_count = db.execute(
+        "SELECT COUNT(*) FROM annotations WHERE annotator = ? AND is_funny != -1",
+        (annotator,),
+    ).fetchone()[0]
+
+    if done_count >= MAX_PER_ANNOTATOR:
+        return render_template("done.html", annotator=annotator, done_count=done_count,
+                               hit_cap=True, cap=MAX_PER_ANNOTATOR)
+
+    # Find the current batch: the lowest batch_num that still has
+    # items needing annotations.
+    current_batch = db.execute(
+        """SELECT MIN(i.batch_num) FROM items i
            WHERE i.annotation_count < ?
+             AND NOT (i.annotation_count < 3 AND i.skip_count >= ?)""",
+        (ANNOTATIONS_REQUIRED, ANNOTATIONS_REQUIRED),
+    ).fetchone()[0]
+
+    if current_batch is None:
+        return render_template("done.html", annotator=annotator, done_count=done_count)
+
+    # Get next item from the current batch
+    query = """SELECT i.* FROM items i
+           WHERE i.batch_num = ?
+             AND i.annotation_count < ?
              AND NOT (i.annotation_count < 3 AND i.skip_count >= ?)
              AND i.id NOT IN (
                  SELECT item_id FROM annotations WHERE annotator = ?
              )"""
-    params = [ANNOTATIONS_REQUIRED, ANNOTATIONS_REQUIRED, annotator]
+    params = [current_batch, ANNOTATIONS_REQUIRED, ANNOTATIONS_REQUIRED, annotator]
 
     if skipped_later:
         placeholders = ",".join("?" * len(skipped_later))
@@ -218,18 +247,7 @@ def annotate():
     item = db.execute(query, params).fetchone()
 
     if item is None:
-        # Count what this annotator has done
-        done = db.execute(
-            "SELECT COUNT(*) FROM annotations WHERE annotator = ?",
-            (annotator,),
-        ).fetchone()[0]
-        return render_template("done.html", annotator=annotator, done_count=done)
-
-    # Progress stats for this annotator
-    done_count = db.execute(
-        "SELECT COUNT(*) FROM annotations WHERE annotator = ?",
-        (annotator,),
-    ).fetchone()[0]
+        return render_template("done.html", annotator=annotator, done_count=done_count)
 
     total_remaining = db.execute(
         """SELECT COUNT(*) FROM items
@@ -246,6 +264,7 @@ def annotate():
         item=item,
         annotator=annotator,
         done_count=done_count,
+        cap=MAX_PER_ANNOTATOR,
         remaining=total_remaining,
     )
 
@@ -386,7 +405,7 @@ def dashboard():
     # Per-annotator stats
     annotators = db.execute(
         """SELECT annotator, COUNT(*) as count,
-                  SUM(CASE WHEN is_funny = 1 THEN 1 ELSE 0 END) as funny_count,
+                  SUM(CASE WHEN is_funny = 1 THEN 1 ELSE 0 END) as yes_count,
                   SUM(CASE WHEN is_funny = -1 THEN 1 ELSE 0 END) as skip_count
            FROM annotations
            GROUP BY annotator
@@ -400,6 +419,47 @@ def dashboard():
            ORDER BY annotation_count""",
     ).fetchall()
 
+    # Batch progress
+    batch_nums = db.execute(
+        "SELECT DISTINCT batch_num FROM items ORDER BY batch_num"
+    ).fetchall()
+    total_batches = len(batch_nums)
+    batches = []
+    for row in batch_nums:
+        bnum = row["batch_num"]
+        batch_total = db.execute(
+            "SELECT COUNT(*) FROM items WHERE batch_num = ?", (bnum,),
+        ).fetchone()[0]
+        batch_done = db.execute(
+            "SELECT COUNT(*) FROM items WHERE batch_num = ? AND annotation_count >= ?",
+            (bnum, ANNOTATIONS_REQUIRED),
+        ).fetchone()[0]
+        batch_broken = db.execute(
+            "SELECT COUNT(*) FROM items WHERE batch_num = ? AND annotation_count < 3 AND skip_count >= ?",
+            (bnum, ANNOTATIONS_REQUIRED),
+        ).fetchone()[0]
+        batch_in_progress = db.execute(
+            "SELECT COUNT(*) FROM items WHERE batch_num = ? AND annotation_count > 0 AND annotation_count < ?",
+            (bnum, ANNOTATIONS_REQUIRED),
+        ).fetchone()[0]
+        if batch_done + batch_broken >= batch_total:
+            status = "complete"
+        elif batch_done > 0 or batch_in_progress > 0:
+            status = "in_progress"
+        else:
+            status = "pending"
+        batches.append({
+            "num": bnum,
+            "total": batch_total,
+            "done": batch_done,
+            "broken": batch_broken,
+            "status": status,
+            "pct": round(batch_done / batch_total * 100, 1) if batch_total > 0 else 0,
+        })
+
+    # Current batch number
+    current_batch = next((b["num"] for b in batches if b["status"] != "complete"), total_batches)
+
     return render_template(
         "dashboard.html",
         total_items=total_items,
@@ -408,8 +468,13 @@ def dashboard():
         completed_items=completed_items,
         broken_items=broken_items,
         required=ANNOTATIONS_REQUIRED,
+        max_per_annotator=MAX_PER_ANNOTATOR,
+        batch_size=BATCH_SIZE,
         annotators=annotators,
         distribution=dist,
+        batches=batches,
+        current_batch=current_batch,
+        total_batches=total_batches,
     )
 
 
@@ -419,6 +484,12 @@ def export():
     if not session.pop("is_admin", None):
         return redirect(url_for("admin_login", next="export"))
     db = get_db()
+    # Build annotator -> anonymous ID mapping
+    annotator_rows = db.execute(
+        "SELECT DISTINCT annotator FROM annotations ORDER BY annotator"
+    ).fetchall()
+    anon_map = {r["annotator"]: f"annotator_{i+1}" for i, r in enumerate(annotator_rows)}
+
     rows = db.execute(
         """SELECT
                a.id,
@@ -443,10 +514,12 @@ def export():
     writer.writerow([
         "annotation_id", "task_id", "candidate_index", "tweet_text",
         "meme_post_id", "image_url", "meme_title", "selection_method",
-        "annotator", "is_funny", "flag_inappropriate", "created_at",
+        "annotator_id", "is_good_reply", "flag_inappropriate", "created_at",
     ])
     for row in rows:
-        writer.writerow(list(row))
+        r = list(row)
+        r[8] = anon_map[r[8]]  # replace email with anonymous ID
+        writer.writerow(r)
 
     from flask import Response
     return Response(

@@ -43,28 +43,73 @@
     <table class="data-table">
         <thead>
             <tr>
-                <th>Name</th>
+                <th>Annotator</th>
                 <th>Annotations</th>
-                <th>Marked Funny</th>
+                <th>Marked Yes</th>
                 <th>Skips</th>
-                <th>Funny Rate</th>
+                <th>Yes Rate</th>
             </tr>
         </thead>
         <tbody>
             {% for a in annotators %}
             {% set real = a['count'] - a['skip_count'] %}
             <tr>
-                <td>{{ a['annotator'] }}</td>
+                <td>Annotator {{ loop.index }}</td>
                 <td>{{ real }}</td>
-                <td>{{ a['funny_count'] }}</td>
+                <td>{{ a['yes_count'] }}</td>
                 <td>{{ a['skip_count'] }}</td>
-                <td>{{ (a['funny_count'] / real * 100) | round(1) if real > 0 else 'N/A' }}%</td>
+                <td>{{ (a['yes_count'] / real * 100) | round(1) if real > 0 else 'N/A' }}%</td>
             </tr>
             {% endfor %}
         </tbody>
     </table>
     {% else %}
     <p>No annotations yet.</p>
+    {% endif %}
+
+    <h2>Batches</h2>
+    <p style="font-size:0.85rem;color:#888;margin-bottom:0.5rem;">
+        {{ batch_size }} items per batch &middot; {{ max_per_annotator }} max per annotator &middot;
+        Currently on batch {{ current_batch }} of {{ total_batches }}
+    </p>
+    {% if batches %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Batch</th>
+                <th>Items</th>
+                <th>Done</th>
+                <th>Broken</th>
+                <th>Progress</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for b in batches %}
+            <tr>
+                <td>{{ b.num }}</td>
+                <td>{{ b.total }}</td>
+                <td>{{ b.done }}</td>
+                <td>{{ b.broken }}</td>
+                <td>
+                    <div style="background:#eee;border-radius:3px;height:8px;width:100px;display:inline-block;vertical-align:middle;">
+                        <div style="background:{% if b.status == 'complete' %}#2ecc71{% elif b.status == 'in_progress' %}#f39c12{% else %}#ddd{% endif %};height:100%;width:{{ b.pct }}%;border-radius:3px;"></div>
+                    </div>
+                    {{ b.pct }}%
+                </td>
+                <td>
+                    {% if b.status == 'complete' %}
+                        <span style="color:#2ecc71;font-weight:600;">Complete</span>
+                    {% elif b.status == 'in_progress' %}
+                        <span style="color:#f39c12;font-weight:600;">In Progress</span>
+                    {% else %}
+                        <span style="color:#bbb;">Pending</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
     {% endif %}
 
     <h2>Annotation Distribution</h2>
