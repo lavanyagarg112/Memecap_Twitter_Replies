@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - Meme Annotation{% endblock %}
+
+{% block content %}
+<div class="dashboard">
+    <h1>Annotation Dashboard</h1>
+
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-number">{{ total_items }}</div>
+            <div class="stat-label">Total Pairs</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{{ total_annotations }}</div>
+            <div class="stat-label">Real Annotations</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{{ total_skips }}</div>
+            <div class="stat-label">Skips (broken image)</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{{ completed_items }}</div>
+            <div class="stat-label">Fully Annotated ({{ required }}+ each)</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{{ broken_items }}</div>
+            <div class="stat-label">Broken Images (all skipped)</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">
+                {% if total_items > 0 %}
+                    {{ (completed_items / total_items * 100) | round(1) }}%
+                {% else %}
+                    0%
+                {% endif %}
+            </div>
+            <div class="stat-label">Completion</div>
+        </div>
+    </div>
+
+    <h2>Annotators</h2>
+    {% if annotators %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Annotations</th>
+                <th>Marked Funny</th>
+                <th>Skips</th>
+                <th>Funny Rate</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for a in annotators %}
+            {% set real = a['count'] - a['skip_count'] %}
+            <tr>
+                <td>{{ a['annotator'] }}</td>
+                <td>{{ real }}</td>
+                <td>{{ a['funny_count'] }}</td>
+                <td>{{ a['skip_count'] }}</td>
+                <td>{{ (a['funny_count'] / real * 100) | round(1) if real > 0 else 'N/A' }}%</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No annotations yet.</p>
+    {% endif %}
+
+    <h2>Annotation Distribution</h2>
+    {% if distribution %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Annotations per Item</th>
+                <th>Number of Items</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for d in distribution %}
+            <tr>
+                <td>{{ d['annotation_count'] }}</td>
+                <td>{{ d['num_items'] }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No data yet.</p>
+    {% endif %}
+
+    <div class="export-section">
+        <a href="{{ url_for('export') }}" class="btn btn-primary">Export Annotations (CSV)</a>
+    </div>
+</div>
+{% endblock %}

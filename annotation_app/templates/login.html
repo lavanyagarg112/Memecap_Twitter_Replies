@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Login - Meme Annotation{% endblock %}
+
+{% block content %}
+<div class="card centered">
+    <h1>Meme Annotation</h1>
+    <p>Judge whether a meme works as a funny reply to a tweet. Do as many as you like — you can stop anytime.</p>
+    <form method="POST" action="{{ url_for('login') }}">
+        <input type="text" name="annotator" required placeholder="Your name" autofocus>
+        <button type="submit" class="btn btn-primary">Start</button>
+    </form>
+</div>
+{% endblock %}
