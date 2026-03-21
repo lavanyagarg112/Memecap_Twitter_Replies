@@ -74,11 +74,13 @@ Open `http://localhost:5001`
 
 ## 6. Annotation App
 
-Collect human judgments on whether memes are funny replies to tweets.
+Collect human judgments: "Would you use this meme as a reply to this tweet?"
 
 Create `annotation_app/.env`:
 ```
 ADMIN_PASSWORD=yourpassword
+MAX_PER_ANNOTATOR=100
+BATCH_SIZE=1000
 ```
 
 Run:
@@ -88,8 +90,10 @@ python app.py
 ```
 Open `http://localhost:5000`
 
-- Annotators enter their email and judge: "Would you use this meme as a reply to this tweet?"
-- Each meme-tweet pair needs 5 annotations
-- Annotators can stop anytime (max 100 per person by default)
-- Admin dashboard at `/admin` (password required)
-- Export annotations as CSV from dashboard
+- Annotators enter their email and rate Yes/No
+- Each meme-tweet pair needs 5 annotations from different people
+- Items are served in batches — one batch completes before the next starts
+- Annotators can stop anytime (capped at `MAX_PER_ANNOTATOR` per person)
+- When a batch is done, bump `MAX_PER_ANNOTATOR` in `.env` and restart
+- Admin dashboard at `/admin` (password required) — tracks batch progress
+- Export anonymized annotations as CSV from dashboard
