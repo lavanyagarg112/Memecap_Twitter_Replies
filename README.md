@@ -74,7 +74,7 @@ Open `http://localhost:5001`
 
 ## 6. Annotation App
 
-Collect human judgments: "Would you use this meme as a reply to this tweet?"
+Collect human judgments: "Does this meme work as a reply to this tweet?"
 
 Create `annotation_app/.env`:
 ```
