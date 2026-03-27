@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Done - Meme Annotation{% endblock %}
+
+{% block content %}
+<div class="card centered">
+    {% if hit_cap %}
+    <h1>You've reached the limit!</h1>
+    <p>You've completed <strong>{{ done_count }}</strong> annotations (max {{ cap }} per person). Thanks for your help!</p>
+    <p>We'll let you know when the next batch is ready.</p>
+    {% else %}
+    <h1>No more items right now</h1>
+    <p>You've completed <strong>{{ done_count }}</strong> annotations. Thanks!</p>
+    <p>All remaining items already have enough responses, or you've seen everything available. Check back later for more.</p>
+    {% endif %}
+</div>
+{% endblock %}

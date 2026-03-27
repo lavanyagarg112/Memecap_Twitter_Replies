@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - Meme Annotation{% endblock %}
+
+{% block content %}
+<div class="dashboard">
+    <h1>Annotation Dashboard</h1>
+
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-number">{{ total_items }}</div>
+            <div class="stat-label">Total Pairs</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{{ total_annotations }}</div>
+            <div class="stat-label">Real Annotations</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{{ total_skips }}</div>
+            <div class="stat-label">Skips (broken image)</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{{ completed_items }}</div>
+            <div class="stat-label">Fully Annotated ({{ required }}+ each)</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{{ broken_items }}</div>
+            <div class="stat-label">Broken Images (all skipped)</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">
+                {% if total_items > 0 %}
+                    {{ (completed_items / total_items * 100) | round(1) }}%
+                {% else %}
+                    0%
+                {% endif %}
+            </div>
+            <div class="stat-label">Completion</div>
+        </div>
+    </div>
+
+    <h2>Annotators</h2>
+    {% if annotators %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Annotator</th>
+                <th>Annotations</th>
+                <th>Marked Yes</th>
+                <th>Skips</th>
+                <th>Yes Rate</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for a in annotators %}
+            {% set real = a['count'] - a['skip_count'] %}
+            <tr>
+                <td>Annotator {{ loop.index }}</td>
+                <td>{{ real }}</td>
+                <td>{{ a['yes_count'] }}</td>
+                <td>{{ a['skip_count'] }}</td>
+                <td>{{ (a['yes_count'] / real * 100) | round(1) if real > 0 else 'N/A' }}%</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No annotations yet.</p>
+    {% endif %}
+
+    <h2>Batches</h2>
+    <p style="font-size:0.85rem;color:#888;margin-bottom:0.5rem;">
+        {{ batch_size }} items per batch &middot; {{ max_per_annotator }} max per annotator &middot;
+        Currently on batch {{ current_batch }} of {{ total_batches }}
+    </p>
+    {% if batches %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Batch</th>
+                <th>Items</th>
+                <th>Done</th>
+                <th>Broken</th>
+                <th>Progress</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for b in batches %}
+            <tr>
+                <td>{{ b.num }}</td>
+                <td>{{ b.total }}</td>
+                <td>{{ b.done }}</td>
+                <td>{{ b.broken }}</td>
+                <td>
+                    <div style="background:#eee;border-radius:3px;height:8px;width:100px;display:inline-block;vertical-align:middle;">
+                        <div style="background:{% if b.status == 'complete' %}#2ecc71{% elif b.status == 'in_progress' %}#f39c12{% else %}#ddd{% endif %};height:100%;width:{{ b.pct }}%;border-radius:3px;"></div>
+                    </div>
+                    {{ b.pct }}%
+                </td>
+                <td>
+                    {% if b.status == 'complete' %}
+                        <span style="color:#2ecc71;font-weight:600;">Complete</span>
+                    {% elif b.status == 'in_progress' %}
+                        <span style="color:#f39c12;font-weight:600;">In Progress</span>
+                    {% else %}
+                        <span style="color:#bbb;">Pending</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+
+    <h2>Annotation Distribution</h2>
+    {% if distribution %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Annotations per Item</th>
+                <th>Number of Items</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for d in distribution %}
+            <tr>
+                <td>{{ d['annotation_count'] }}</td>
+                <td>{{ d['num_items'] }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No data yet.</p>
+    {% endif %}
+
+    <div class="export-section">
+        <a href="{{ url_for('export') }}" class="btn btn-primary">Export Annotations (CSV)</a>
+    </div>
+</div>
+{% endblock %}

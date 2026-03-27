@@ -1,99 +1,78 @@
 # Meme Reply Selection Pipeline
 
-## Quick Start
+Trains a model to rank memes as replies to tweets. Given a tweet, the model learns which memes work as good replies based on human + model annotations.
 
-To view the pre-generated candidate meme pairings:
-
-```
-pip install flask
-python view_candidates_v2.py
-```
-Open `http://localhost:5001`
-
-## Full Pipeline Setup
+## Project Structure
 
 ```
-pip install requests numpy sentence-transformers flask python-dotenv
+project/
+├── pre-training/       # Data collection & annotation pipeline
+│   ├── annotation_app/ # Flask app for human annotations
+│   ├── annotate_parallel.py   # Multi-model VLM annotation (parallel)
+│   ├── annotate_with_models.py # Multi-model VLM annotation (sequential)
+│   ├── create_train_data.py   # Generate train/val/test splits
+│   ├── annotations.csv        # Human annotations
+│   ├── annotations_augmented.csv # Human + model annotations
+│   └── meme_rankings.csv      # Ranked meme candidates per tweet
+├── training/           # Model training
+│   ├── data/
+│   │   ├── train.csv, val.csv, test.csv          # Full dataset
+│   │   └── clean/
+│   │       └── train_clean.csv, val_clean.csv, test_clean.csv  # Flagged memes removed
+│   └── init.py
+└── README.md
 ```
 
-Create a `.env` file in the project root:
+## Pipeline
+
+### 1. Pre-training (data collection)
+
+All scripts in `pre-training/`. See [`pre-training/README.md`](pre-training/README.md) for detailed steps.
+
 ```
-OPENROUTER_API_KEY=your_key_here
-```
-
-## 1. Generate Synthetic Tweets
-
-**Direct style** (tweet closely matches meme context):
-```
-python create_train_context_3.py
-```
-Output: `train_memecap_tweets.jsonl`
-
-**Indirect style** (tweet is topically different, shares emotional energy):
-```
-python create_train_context_4.py
-```
-Output: `train_memecap_tweets_indirect.jsonl`
-
-Both scripts generate 1 tweet per meme from the MemeCap trainval split (1500 memes).
-
-## 2. Clean Tweet Files
-
-Removes errors and keeps both files balanced (if a meme errors in either file, it's removed from both):
-```
-python clean_tweets.py
-```
-Output: `train_memecap_tweets_clean.jsonl`, `train_memecap_tweets_indirect_clean.jsonl`
-
-## 3. Flag Offensive Memes
-
-Interactive review — scans memes for offensive words, you decide which to exclude:
-```
-python flag_memes.py
-```
-Output: `flagged_memes.json`
-
-You can quit with `q` and resume later — progress is saved.
-
-## 4. Select Candidate Memes
-
-For each tweet, selects 9 distractor memes (4 semantic + 5 random) plus the original:
-```
-python select_candidates_v2.py
-```
-Reads `flagged_memes.json` to exclude confirmed-offensive memes.
-Output: `annotation_tasks_clean.json`
-
-## 5. View Candidates
-
-Browse tweet-meme pairings locally. Filter by direct/indirect style:
-```
-python view_candidates_v2.py
-```
-Open `http://localhost:5001`
-
-## 6. Annotation App
-
-Collect human judgments: "Does this meme work as a reply to this tweet?"
-
-Create `annotation_app/.env`:
-```
-ADMIN_PASSWORD=yourpassword
-MAX_PER_ANNOTATOR=100
-BATCH_SIZE=1000
+Generate tweets → Clean → Flag memes → Select candidates → Human annotation → Model annotation → Rankings → Train data
 ```
 
-Run:
-```
-cd annotation_app
-python app.py
-```
-Open `http://localhost:5000`
+### 2. Annotation
 
-- Annotators enter their email and rate Yes/No
-- Each meme-tweet pair needs 5 annotations from different people
-- Items are served in batches — one batch completes before the next starts
-- Annotators can stop anytime (capped at `MAX_PER_ANNOTATOR` per person)
-- When a batch is done, bump `MAX_PER_ANNOTATOR` in `.env` and restart
-- Admin dashboard at `/admin` (password required) — tracks batch progress
-- Export anonymized annotations as CSV from dashboard
+Human annotators judge meme-tweet pairs ("does this meme work as a reply?"). To augment limited human annotations, 3 VLM models (seed-1.6-flash, gemini-lite, gemini-3-flash) simulate additional annotators.
+
+Each item gets 3 total annotations (human + model combined). Broken images are skipped.
+
+### 3. Training Data
+
+Pointwise format — one row per tweet-meme pair:
+
+| Column | Description |
+|--------|-------------|
+| `tweet_text` | The tweet |
+| `meme_title` | Meme title |
+| `img_captions` | MemeCap image descriptions |
+| `meme_captions` | MemeCap meme meaning |
+| `metaphors` | MemeCap visual metaphors |
+| `selection_method` | original / semantic / random |
+| `avg_score` | Mean annotation score (0-1) |
+| `rank` | Rank within the tweet's candidates (1 = best) |
+
+Two versions: full (all memes) and clean (user-flagged inappropriate memes removed).
+
+Split: 80/10/10 by task (all candidates for a tweet stay in the same split).
+
+## Setup
+
+```bash
+pip install requests python-dotenv
+export OPENROUTER_API_KEY=your_key
+```
+
+## Quick Run
+
+```bash
+# Annotate (from pre-training/)
+cd pre-training
+python annotate_parallel.py --dry-run   # preview
+python annotate_parallel.py             # run (~1 hour)
+
+# Generate training data
+python create_train_data.py
+```

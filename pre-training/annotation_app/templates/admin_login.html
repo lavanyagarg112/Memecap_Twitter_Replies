@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Admin - Meme Annotation{% endblock %}
+
+{% block content %}
+<div class="card centered">
+    <h1>Admin</h1>
+    {% if error %}
+    <p style="color: #e74c3c;">{{ error }}</p>
+    {% endif %}
+    <form method="POST" action="{{ url_for('admin_login', next=request.args.get('next', 'dashboard')) }}">
+        <input type="password" name="password" required placeholder="Password" autofocus>
+        <button type="submit" class="btn btn-primary">Login</button>
+    </form>
+</div>
+{% endblock %}
