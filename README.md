@@ -6,42 +6,48 @@ Trains a model to rank memes as replies to tweets. Given a tweet, the model lear
 
 ```
 project/
-├── pre-training/       # Data collection & annotation pipeline
-│   ├── annotation_app/ # Flask app for human annotations
-│   ├── annotate_parallel.py   # Multi-model VLM annotation (parallel)
-│   ├── annotate_with_models.py # Multi-model VLM annotation (sequential)
-│   ├── create_train_data.py   # Generate train/val/test splits
-│   ├── annotations.csv        # Human annotations
-│   ├── annotations_augmented.csv # Human + model annotations
-│   └── meme_rankings.csv      # Ranked meme candidates per tweet
-├── training/           # Model training
+├── pre-training/               # Data collection pipelines
+│   ├── annotation_app/         # Flask app for human annotations
+│   ├── non-annotation/         # VLM similarity pipeline (no annotation needed)
+│   │   ├── rank_similar_memes.py   # Main pipeline
+│   │   └── view_rankings.py        # Visualise results
+│   ├── annotate_parallel.py    # Multi-model VLM annotation (parallel)
+│   ├── create_train_data.py    # Generate train/val/test splits
+│   └── meme_rankings.csv       # Ranked meme candidates per tweet
+├── training/                   # Model training
 │   ├── data/
-│   │   ├── train.csv, val.csv, test.csv          # Full dataset
+│   │   ├── train.csv, val.csv, test.csv
 │   │   └── clean/
-│   │       └── train_clean.csv, val_clean.csv, test_clean.csv  # Flagged memes removed
+│   │       └── train_clean.csv, val_clean.csv, test_clean.csv
 │   └── init.py
 └── README.md
 ```
 
-## Pipeline
+## Pipelines
 
-### 1. Pre-training (data collection)
+### Pipeline A: Non-Annotation (primary)
 
-All scripts in `pre-training/`. See [`pre-training/README.md`](pre-training/README.md) for detailed steps.
+Uses real tweets from [HSDSLab/TwitterMemes](https://huggingface.co/datasets/HSDSLab/TwitterMemes). A VLM describes each tweet+meme, then the top 10 most semantically similar MemeCap memes are ranked via embedding similarity. No human annotation required.
+
+```bash
+cd pre-training/non-annotation
+python rank_similar_memes.py --limit 500    # ~$0.10, ~15 min
+python view_rankings.py                     # visualise at localhost:5002
+```
+
+See [`pre-training/README.md`](pre-training/README.md) for full details.
+
+### Pipeline B: Annotation-based
+
+Synthetic tweets + human/VLM annotation. Scripts in `pre-training/`. See [`pre-training/README.md`](pre-training/README.md).
 
 ```
 Generate tweets → Clean → Flag memes → Select candidates → Human annotation → Model annotation → Rankings → Train data
 ```
 
-### 2. Annotation
+### Training Data
 
-Human annotators judge meme-tweet pairs ("does this meme work as a reply?"). To augment limited human annotations, 3 VLM models (seed-1.6-flash, gemini-lite, gemini-3-flash) simulate additional annotators.
-
-Each item gets 3 total annotations (human + model combined). Broken images are skipped.
-
-### 3. Training Data
-
-Pointwise format — one row per tweet-meme pair:
+Both pipelines output the same pointwise format — one row per tweet-meme pair:
 
 | Column | Description |
 |--------|-------------|
@@ -50,13 +56,11 @@ Pointwise format — one row per tweet-meme pair:
 | `img_captions` | MemeCap image descriptions |
 | `meme_captions` | MemeCap meme meaning |
 | `metaphors` | MemeCap visual metaphors |
-| `selection_method` | original / semantic / random |
-| `avg_score` | Mean annotation score (0-1) |
+| `selection_method` | original / semantic / random / vlm_similarity |
+| `avg_score` | Annotation score or cosine similarity (0-1) |
 | `rank` | Rank within the tweet's candidates (1 = best) |
 
-Two versions: full (all memes) and clean (user-flagged inappropriate memes removed).
-
-Split: 80/10/10 by task (all candidates for a tweet stay in the same split).
+Split: 80/10/10 by task. Flagged inappropriate memes automatically excluded.
 
 ## Setup
 
@@ -68,11 +72,14 @@ export OPENROUTER_API_KEY=your_key
 ## Quick Run
 
 ```bash
-# Annotate (from pre-training/)
-cd pre-training
-python annotate_parallel.py --dry-run   # preview
-python annotate_parallel.py             # run (~1 hour)
+# Non-annotation pipeline (recommended)
+cd pre-training/non-annotation
+python rank_similar_memes.py --limit 500 --dry-run
+python rank_similar_memes.py --limit 500
 
-# Generate training data
+# Or annotation pipeline
+cd pre-training
+python annotate_parallel.py --dry-run
+python annotate_parallel.py
 python create_train_data.py
 ```

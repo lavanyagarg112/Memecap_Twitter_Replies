@@ -1,5 +1,22 @@
 # Pre-training: Data Collection & Annotation Pipeline
 
+## Non-Annotation Pipeline (NEW)
+
+Alternative pipeline using real tweets from [HSDSLab/TwitterMemes](https://huggingface.co/datasets/HSDSLab/TwitterMemes) instead of synthetic ones. Uses a VLM to describe each tweet+meme, then ranks the top 10 most semantically similar MemeCap memes via embedding similarity. No human annotation needed.
+
+```bash
+cd non-annotation
+pip install datasets Pillow
+python rank_similar_memes.py --limit 500 --dry-run   # check cost
+python rank_similar_memes.py --limit 500              # run (~$0.10)
+python rank_similar_memes.py --rerank                 # optional VLM re-ranking
+python view_rankings.py                               # visualise results (localhost:5002)
+```
+
+Outputs `train.csv`, `val.csv`, `test.csv` in the same format as the annotation pipeline. Flagged memes from `flagged_memes.json` are automatically excluded.
+
+---
+
 ## Setup
 
 ```bash
