@@ -82,7 +82,7 @@ VAL_RATIO = 0.1
 TEST_RATIO = 0.1
 SPLIT_SEED = 42
 
-# Output CSV fields — matches annotation pipeline's create_train_data.py
+# Output CSV fields
 OUTPUT_CSV_FIELDS = [
     "task_id",
     "tweet_text",
@@ -95,10 +95,7 @@ OUTPUT_CSV_FIELDS = [
     "selection_method",
     "candidate_index",
     "rank",
-    "avg_score",
-    "num_votes",
-    "num_yes",
-    "num_no",
+    "similarity_score",
 ]
 
 
@@ -688,10 +685,7 @@ def run_phase4(results: List[dict], script_dir: Path, rerank: bool):
                 "selection_method": selection,
                 "candidate_index": meme["rank"] - 1,
                 "rank": meme["rank"],
-                "avg_score": meme.get("similarity_score", 0.0),
-                "num_votes": 0,
-                "num_yes": 0,
-                "num_no": 0,
+                "similarity_score": meme.get("similarity_score", 0.0),
             })
         task_rows[tid] = rows
 

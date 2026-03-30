@@ -47,7 +47,7 @@ Generate tweets → Clean → Flag memes → Select candidates → Human annotat
 
 ### Training Data
 
-Both pipelines output the same pointwise format — one row per tweet-meme pair:
+Both pipelines output pointwise format — one row per tweet-meme pair. Shared columns:
 
 | Column | Description |
 |--------|-------------|
@@ -56,9 +56,15 @@ Both pipelines output the same pointwise format — one row per tweet-meme pair:
 | `img_captions` | MemeCap image descriptions |
 | `meme_captions` | MemeCap meme meaning |
 | `metaphors` | MemeCap visual metaphors |
-| `selection_method` | original / semantic / random / vlm_similarity |
-| `avg_score` | Annotation score or cosine similarity (0-1) |
 | `rank` | Rank within the tweet's candidates (1 = best) |
+
+Pipeline-specific columns:
+
+| Column | Pipeline A (non-annotation) | Pipeline B (annotation) |
+|--------|---------------------------|------------------------|
+| `selection_method` | `vlm_similarity` / `vlm_reranked` | `original` / `semantic` / `random` |
+| scoring | `similarity_score` (cosine, 0-1) | `avg_score` (mean of yes/no votes, 0-1) |
+| vote counts | — | `num_votes`, `num_yes`, `num_no` |
 
 Split: 80/10/10 by task. Flagged inappropriate memes automatically excluded.
 
