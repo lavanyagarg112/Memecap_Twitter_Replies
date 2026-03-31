@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Meme Reply Selection Experiment Report</title>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --surface: #ffffff;
+      --surface-2: #f8fafc;
+      --text: #172033;
+      --muted: #5f6b7a;
+      --line: #dbe3ee;
+      --blue: #2563eb;
+      --teal: #0f766e;
+      --gold: #c98b00;
+      --shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+      --radius: 18px;
+      --radius-sm: 12px;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: linear-gradient(180deg, #eef4fb 0%, var(--bg) 160px); color: var(--text); }
+    .page { max-width: 1180px; margin: 0 auto; padding: 28px 20px 60px; }
+    .hero { background: linear-gradient(135deg, #0f2742 0%, #1d4d8f 60%, #1f7a8c 100%); color: #fff; border-radius: 28px; padding: 32px 34px; box-shadow: var(--shadow); }
+    .hero-top { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px; align-items: flex-start; }
+    .eyebrow { letter-spacing: 0.12em; text-transform: uppercase; font-size: 12px; opacity: 0.82; margin-bottom: 12px; }
+    h1 { margin: 0; font-size: clamp(2rem, 4vw, 3rem); line-height: 1.05; }
+    .subtitle { margin: 12px 0 0; max-width: 760px; color: rgba(255,255,255,0.9); font-size: 1.03rem; }
+    .hero-meta { display: grid; gap: 10px; min-width: 260px; }
+    .meta-chip { background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.16); padding: 10px 12px; border-radius: 14px; font-size: 0.95rem; }
+    .meta-chip strong { display: block; font-size: 0.77rem; opacity: 0.8; margin-bottom: 4px; }
+    .section { margin-top: 24px; background: var(--surface); border: 1px solid rgba(219, 227, 238, 0.85); border-radius: var(--radius); box-shadow: var(--shadow); padding: 26px 26px 24px; }
+    .section h2 { margin: 0 0 14px; font-size: 1.45rem; }
+    .section p { margin: 0 0 12px; color: var(--muted); }
+    .summary-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 18px; }
+    .callout { background: linear-gradient(180deg, #f9fbff 0%, #f4f8fd 100%); border: 1px solid var(--line); border-radius: 16px; padding: 18px; }
+    .callout h3 { margin: 0 0 10px; font-size: 1.06rem; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .chip { background: #eef4ff; border: 1px solid #cad9ff; color: #24477b; border-radius: 999px; padding: 6px 10px; font-size: 0.84rem; }
+    .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 14px; }
+    .metric-card { background: linear-gradient(180deg, #ffffff 0%, #f9fbfe 100%); border: 1px solid var(--line); border-radius: 16px; padding: 16px; min-height: 122px; min-width: 0; overflow-wrap: anywhere; }
+    .metric-card .label { color: var(--muted); font-size: 0.86rem; margin-bottom: 10px; }
+    .metric-card .value { font-size: 1.8rem; font-weight: 700; line-height: 1; margin-bottom: 8px; }
+    .metric-card .detail { color: var(--muted); font-size: 0.9rem; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 16px; }
+    table { width: 100%; border-collapse: separate; border-spacing: 0; min-width: 0; }
+    .table-wrap table { min-width: 940px; }
+    th, td { padding: 13px 14px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { background: #f7fafc; color: #334155; font-size: 0.84rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    tr:nth-child(even) td { background: #fbfdff; }
+    tr:hover td { background: #f4f8fd; }
+    .best { background: #fff6d8 !important; font-weight: 700; color: #6b4f00; }
+    .code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #f3f6fa; border: 1px solid #dde5ef; border-radius: 10px; padding: 2px 6px; word-break: break-word; }
+    .cmd-list { display: grid; gap: 10px; margin: 14px 0; }
+    .cmd { background: #0f172a; color: #eff6ff; border-radius: 14px; padding: 12px 14px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92rem; overflow-x: auto; }
+    .issues { display: grid; gap: 10px; }
+    .issue { border-left: 4px solid var(--gold); background: #fffaf0; padding: 12px 14px; border-radius: 12px; color: #5b4a22; }
+    .exp-grid { display: grid; gap: 20px; }
+    .exp-card { border: 1px solid var(--line); border-radius: 20px; overflow: hidden; background: linear-gradient(180deg, #ffffff 0%, #fbfdff 100%); }
+    .exp-head { padding: 20px 22px; color: #fff; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; }
+    .exp-head.similarity { background: linear-gradient(135deg, #1d4ed8, #2563eb); }
+    .exp-head.preference { background: linear-gradient(135deg, #0f766e, #0d9488); }
+    .exp-head h3 { margin: 0; font-size: 1.4rem; }
+    .exp-head p { margin: 6px 0 0; color: rgba(255,255,255,0.86); }
+    .badges { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
+    .badge { background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.22); padding: 7px 10px; border-radius: 999px; font-size: 0.85rem; }
+    .exp-body { padding: 22px; }
+    .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .mini-card { border: 1px solid var(--line); border-radius: 14px; padding: 12px; background: #fff; min-width: 0; overflow-wrap: anywhere; }
+    .mini-card .k { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .mini-card .v { margin-top: 6px; font-size: 1.12rem; font-weight: 700; word-break: break-word; }
+    .two-col { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr); gap: 18px; }
+    .subsection { border: 1px solid var(--line); border-radius: 16px; padding: 18px; background: #fff; min-width: 0; overflow: hidden; }
+    .subsection h4 { margin: 0 0 12px; font-size: 1.04rem; }
+    .subsection ul { margin: 10px 0 0 18px; color: var(--muted); }
+    .subsection table { min-width: 0; table-layout: fixed; }
+    .subsection th, .subsection td { word-break: break-word; overflow-wrap: anywhere; }
+    .plot-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-top: 16px; }
+    .plot-card { border: 1px solid var(--line); border-radius: 16px; padding: 12px; background: #fff; }
+    .plot-card img { width: 100%; border-radius: 10px; display: block; }
+    .plot-card figcaption { margin-top: 8px; color: var(--muted); font-size: 0.9rem; }
+    .artifact-table td:first-child, .artifact-table th:first-child { width: 140px; }
+    .exp-body, .exp-card, .section { min-width: 0; }
+    .muted { color: var(--muted); }
+    a { color: #1d4ed8; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    @media (max-width: 1040px) {
+      .plot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .summary-grid, .two-col { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 720px) {
+      .page { padding: 18px 14px 42px; }
+      .hero { padding: 24px 22px; border-radius: 22px; }
+      .plot-grid { grid-template-columns: 1fr; }
+      .section { padding: 20px 18px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div class="hero-top">
+        <div>
+          <div class="eyebrow">Experiment Report</div>
+          <h1>Meme Reply Selection Experiment Report</h1>
+          <p class="subtitle">End-to-end comparison of grouped meme reply ranking experiments using the repository’s saved outputs, with Score@1 as the primary selection metric and reduced 5-epoch CPU runs for practical execution.</p>
+        </div>
+        <div class="hero-meta">
+          <div class="meta-chip"><strong>Generated</strong>2026-03-31T10:34:44</div>
+          <div class="meta-chip"><strong>Project</strong>Meme Reply Selection with PyTorch</div>
+          <div class="meta-chip"><strong>Primary Metric</strong>Score@1</div>
+        </div>
+      </div>
+    </header>
+
+    <section class="section">
+      <h2>Executive Summary</h2>
+      <div class="summary-grid">
+        <div class="callout">
+          <h3>What was run</h3>
+          <p>Two experiments were completed from the saved repository outputs: a similarity-based ranker and a preference-based ranker. Both used the same grouped task setup, GRU text encoder, hinge loss, and candidate text fields from the saved configs.</p>
+          <div class="chips">
+            <span class="chip">2 experiments</span>
+            <span class="chip">Similarity vs Preference</span>
+            <span class="chip">Grouped ranking by task_id</span>
+            <span class="chip">Reduced 5-epoch CPU runs</span>
+          </div>
+        </div>
+        <div class="callout">
+          <h3>Main outcome</h3>
+          <p>The <strong>preference</strong> model was the strongest run on both best validation Score@1 (<strong>0.3125</strong>) and test Score@1 (<strong>0.2615</strong>). The <strong>similarity</strong> model was slightly stronger on test MRR (<strong>0.3898</strong> vs 0.3774).</p>
+          <p class="muted">These were reduced runs rather than full-scale training, so the report is best interpreted as a solid implementation-level comparison rather than a final benchmark claim.</p>
+        </div>
+      </div>
+    </section>
+<section class="section"><h2>Key Metrics Overview</h2><div class="metric-grid"><div class="metric-card"><div class="label">Experiments Run</div><div class="value">2</div><div class="detail">Completed training/eval/inference runs reflected in this report.</div></div><div class="metric-card"><div class="label">Best Validation Score@1</div><div class="value">0.3125</div><div class="detail">Preference</div></div><div class="metric-card"><div class="label">Best Test Score@1</div><div class="value">0.2615</div><div class="detail">Preference</div></div><div class="metric-card"><div class="label">Best Test Recall@1</div><div class="value">0.1692</div><div class="detail">Across saved test evaluations</div></div><div class="metric-card"><div class="label">Best Test MRR</div><div class="value">0.3898</div><div class="detail">Across saved test evaluations</div></div><div class="metric-card"><div class="label">Best Test nDCG@k</div><div class="value">0.5209</div><div class="detail">Across saved test evaluations</div></div></div></section>
+    <section class="section">
+      <h2>Experiment Comparison</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Experiment</th>
+              <th>Model</th>
+              <th>Encoder</th>
+              <th>Loss</th>
+              <th>Status</th>
+              <th>Best Epoch</th>
+              <th>Best Val Score@1</th>
+              <th>Test Score@1</th>
+              <th>Test Recall@1</th>
+              <th>Test MRR</th>
+              <th>Test nDCG@k</th>
+              <th>Checkpoint</th>
+            </tr>
+          </thead>
+          <tbody>
+<tr><td><strong>Similarity</strong></td><td>similarity</td><td>gru</td><td>hinge</td><td>completed</td><td>1</td><td class="">0.2917</td><td class="">0.2564</td><td class="best">0.1692</td><td class="best">0.3898</td><td class="">0.4870</td><td><span class="code">results/similarity/best.pt</span></td></tr><tr><td><strong>Preference</strong></td><td>preference</td><td>gru</td><td>hinge</td><td>completed</td><td>4</td><td class="best">0.3125</td><td class="best">0.2615</td><td class="best">0.1692</td><td class="">0.3774</td><td class="best">0.5209</td><td><span class="code">results/preference/best.pt</span></td></tr></tbody></table></div></section><section class="section"><h2>README-Derived Execution Summary</h2><p>The README was used as the primary execution reference. The commands below were extracted directly from it and then adapted only where the environment required it.</p><div class="cmd-list"><div class="cmd">python train.py --model_type similarity</div><div class="cmd">python train.py --model_type preference</div><div class="cmd">python eval.py --checkpoint checkpoints/best.pt --split test</div><div class="cmd">python eval.py --checkpoint checkpoints/best.pt --split val</div><div class="cmd">python inference.py --checkpoint checkpoints/best.pt --tweet_text &quot;...&quot; --candidates_json candidates.json</div><div class="cmd">python inference.py --checkpoint checkpoints/best.pt --tweet_text &quot;Example context&quot; --candidates_json candidates.json --top_k 3</div></div><div class="issues"><div class="issue">README commands were used as the primary workflow reference.</div><div class="issue">The environment provides python3 rather than python, so commands were executed with python3.</div><div class="issue">Torch runtime required execution outside the sandbox due an OpenMP/shared-memory restriction in the sandbox.</div><div class="issue">Training was run for 5 epochs on CPU as a reduced but meaningful end-to-end experiment.</div><div class="issue">No additional code changes were required to rebuild the report itself.</div><div class="issue">The execution path used python3 instead of python because the environment exposes python3 only.</div><div class="issue">Torch runs had to execute outside the sandbox because the sandbox runtime blocked Torch initialization.</div></div></section><section class="section"><h2>Detailed Experiment Sections</h2><div class="exp-grid">
+      <article class="exp-card">
+        <div class="exp-head similarity">
+          <div>
+            <h3>Similarity</h3>
+            <p>python3 -u train.py --model_type similarity --device cpu --num_epochs 5 --save_dir results/similarity</p>
+          </div>
+          <div class="badges">
+            <span class="badge">Model: similarity</span>
+            <span class="badge">Encoder: gru</span>
+            <span class="badge">Loss: hinge</span>
+            <span class="badge">Best epoch: 1</span>
+          </div>
+        </div>
+        <div class="exp-body">
+          <div class="stats-row">
+            <div class="mini-card"><div class="k">Best Val Score@1</div><div class="v">0.2917</div></div>
+            <div class="mini-card"><div class="k">Test Score@1</div><div class="v">0.2564</div></div>
+            <div class="mini-card"><div class="k">Test Recall@1</div><div class="v">0.1692</div></div>
+            <div class="mini-card"><div class="k">Test MRR</div><div class="v">0.3898</div></div>
+            <div class="mini-card"><div class="k">Test nDCG@k</div><div class="v">0.4870</div></div>
+            <div class="mini-card"><div class="k">Checkpoint</div><div class="v" style="font-size:0.94rem;"><span class="code">results/similarity/best.pt</span></div></div>
+          </div>
+          <div class="two-col">
+            <div class="subsection">
+              <h4>Configuration Snapshot</h4>
+              <table>
+                <tbody>
+                  <tr><th>Dataset paths</th><td><span class="code">data/clean/train_clean.csv</span><br><span class="code">data/clean/val_clean.csv</span><br><span class="code">data/clean/test_clean.csv</span></td></tr>
+                  <tr><th>Candidate text fields</th><td><span class="code">meme_title, img_captions, meme_captions, metaphors</span></td></tr>
+                  <tr><th>Batch size</th><td>32</td></tr>
+                  <tr><th>Epochs</th><td>5</td></tr>
+                  <tr><th>Learning rate</th><td>0.001</td></tr>
+                  <tr><th>Device</th><td>cpu</td></tr>
+                  <tr><th>Seed</th><td>42</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="subsection">
+              <h4>Run Quality Notes</h4>
+              <p>Validation Score@1 peaked at epoch 1 (0.2917) and finished -0.0782 lower at epoch 5, suggesting some post-peak softening in the reduced run.</p>
+              <ul>
+                <li>Best validation checkpoint selected by Score@1, matching the repository design.</li>
+                <li>Final test metrics came from the saved <span class="code">eval.py</span> output for the best checkpoint.</li>
+                <li>Sample inference outputs were generated from the saved test task candidate set.</li>
+              </ul>
+            </div>
+          </div>
+          <div class="plot-grid">
+            <figure class="plot-card">
+              <img src="plots/similarity_train_loss.png" alt="similarity train loss plot" />
+              <figcaption>Train loss vs epoch</figcaption>
+            </figure>
+            <figure class="plot-card">
+              <img src="plots/similarity_val_score_at_1.png" alt="similarity validation Score@1 plot" />
+              <figcaption>Validation Score@1 vs epoch</figcaption>
+            </figure>
+            <figure class="plot-card">
+              <img src="plots/similarity_val_mrr.png" alt="similarity validation MRR plot" />
+              <figcaption>Validation MRR vs epoch</figcaption>
+            </figure>
+          </div>
+          <div class="two-col" style="margin-top:18px;">
+            <div class="subsection">
+              <h4>Final Test Metrics</h4>
+              <table>
+                <tbody>
+                  <tr><th>Loss</th><td>0.9887</td></tr>
+                  <tr><th>Score@1</th><td>0.2564</td></tr>
+                  <tr><th>Recall@1</th><td>0.1692</td></tr>
+                  <tr><th>MRR</th><td>0.3898</td></tr>
+                  <tr><th>nDCG@k</th><td>0.4870</td></tr>
+                  <tr><th>Consensus hit rate</th><td>0.1077</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="subsection">
+              <h4>Sample Inference Top-3</h4>
+              <table>
+                <thead><tr><th>Rank</th><th>Meme Post ID</th><th>Score</th><th>Title</th></tr></thead>
+                <tbody>
+<tr><td>1</td><td>yvgu75</td><td>0.1039</td><td>Stare of judgement right there</td></tr><tr><td>2</td><td>z12aml</td><td>0.0844</td><td>[awkward silence]</td></tr><tr><td>3</td><td>yhe3xu</td><td>0.0489</td><td>I&#x27;d help you look but the ground keeps moving</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </article>
+    
+      <article class="exp-card">
+        <div class="exp-head preference">
+          <div>
+            <h3>Preference</h3>
+            <p>python3 -u train.py --model_type preference --device cpu --num_epochs 5 --save_dir results/preference</p>
+          </div>
+          <div class="badges">
+            <span class="badge">Model: preference</span>
+            <span class="badge">Encoder: gru</span>
+            <span class="badge">Loss: hinge</span>
+            <span class="badge">Best epoch: 4</span>
+          </div>
+        </div>
+        <div class="exp-body">
+          <div class="stats-row">
+            <div class="mini-card"><div class="k">Best Val Score@1</div><div class="v">0.3125</div></div>
+            <div class="mini-card"><div class="k">Test Score@1</div><div class="v">0.2615</div></div>
+            <div class="mini-card"><div class="k">Test Recall@1</div><div class="v">0.1692</div></div>
+            <div class="mini-card"><div class="k">Test MRR</div><div class="v">0.3774</div></div>
+            <div class="mini-card"><div class="k">Test nDCG@k</div><div class="v">0.5209</div></div>
+            <div class="mini-card"><div class="k">Checkpoint</div><div class="v" style="font-size:0.94rem;"><span class="code">results/preference/best.pt</span></div></div>
+          </div>
+          <div class="two-col">
+            <div class="subsection">
+              <h4>Configuration Snapshot</h4>
+              <table>
+                <tbody>
+                  <tr><th>Dataset paths</th><td><span class="code">data/clean/train_clean.csv</span><br><span class="code">data/clean/val_clean.csv</span><br><span class="code">data/clean/test_clean.csv</span></td></tr>
+                  <tr><th>Candidate text fields</th><td><span class="code">meme_title, img_captions, meme_captions, metaphors</span></td></tr>
+                  <tr><th>Batch size</th><td>32</td></tr>
+                  <tr><th>Epochs</th><td>5</td></tr>
+                  <tr><th>Learning rate</th><td>0.001</td></tr>
+                  <tr><th>Device</th><td>cpu</td></tr>
+                  <tr><th>Seed</th><td>42</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="subsection">
+              <h4>Run Quality Notes</h4>
+              <p>Validation Score@1 peaked at epoch 4 (0.3125) and finished -0.0208 lower at epoch 5, suggesting some post-peak softening in the reduced run.</p>
+              <ul>
+                <li>Best validation checkpoint selected by Score@1, matching the repository design.</li>
+                <li>Final test metrics came from the saved <span class="code">eval.py</span> output for the best checkpoint.</li>
+                <li>Sample inference outputs were generated from the saved test task candidate set.</li>
+              </ul>
+            </div>
+          </div>
+          <div class="plot-grid">
+            <figure class="plot-card">
+              <img src="plots/preference_train_loss.png" alt="preference train loss plot" />
+              <figcaption>Train loss vs epoch</figcaption>
+            </figure>
+            <figure class="plot-card">
+              <img src="plots/preference_val_score_at_1.png" alt="preference validation Score@1 plot" />
+              <figcaption>Validation Score@1 vs epoch</figcaption>
+            </figure>
+            <figure class="plot-card">
+              <img src="plots/preference_val_mrr.png" alt="preference validation MRR plot" />
+              <figcaption>Validation MRR vs epoch</figcaption>
+            </figure>
+          </div>
+          <div class="two-col" style="margin-top:18px;">
+            <div class="subsection">
+              <h4>Final Test Metrics</h4>
+              <table>
+                <tbody>
+                  <tr><th>Loss</th><td>0.9797</td></tr>
+                  <tr><th>Score@1</th><td>0.2615</td></tr>
+                  <tr><th>Recall@1</th><td>0.1692</td></tr>
+                  <tr><th>MRR</th><td>0.3774</td></tr>
+                  <tr><th>nDCG@k</th><td>0.5209</td></tr>
+                  <tr><th>Consensus hit rate</th><td>0.1692</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="subsection">
+              <h4>Sample Inference Top-3</h4>
+              <table>
+                <thead><tr><th>Rank</th><th>Meme Post ID</th><th>Score</th><th>Title</th></tr></thead>
+                <tbody>
+<tr><td>1</td><td>z12aml</td><td>1.2891</td><td>[awkward silence]</td></tr><tr><td>2</td><td>z7854t</td><td>-0.0909</td><td>What other lies have the council told me?</td></tr><tr><td>3</td><td>yvgu75</td><td>-0.1471</td><td>Stare of judgement right there</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </article>
+    </div></section>
+    <section class="section">
+      <h2>Configuration and Reproducibility</h2>
+      <div class="two-col">
+        <div class="subsection">
+          <h4>Shared setup across runs</h4>
+          <table>
+            <tbody>
+              <tr><th>Seed</th><td>42</td></tr>
+              <tr><th>Batch size</th><td>32</td></tr>
+              <tr><th>Epochs</th><td>5</td></tr>
+              <tr><th>Learning rate</th><td>0.001</td></tr>
+              <tr><th>Device</th><td>cpu</td></tr>
+              <tr><th>Candidate text fields</th><td><span class="code">meme_title, img_captions, meme_captions, metaphors</span></td></tr>
+              <tr><th>Encoder type</th><td>gru</td></tr>
+              <tr><th>Loss type</th><td>hinge</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="subsection">
+          <h4>Execution deviations</h4>
+          <ul>
+            <li>Runs were reduced to 5 epochs on CPU for practicality.</li>
+            <li>The environment required <span class="code">python3</span> instead of <span class="code">python</span>.</li>
+            <li>Torch execution had to happen outside the sandbox because the sandbox blocked runtime initialization.</li>
+            <li>No new model or data-path changes were introduced while rebuilding the report.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+<section class="section"><h2>Generated Artifacts</h2><div class="table-wrap"><table class="artifact-table"><thead><tr><th>Scope</th><th>Type</th><th>Path</th></tr></thead><tbody><tr><td>similarity</td><td>Checkpoint</td><td><span class="code">results/similarity/best.pt</span></td></tr><tr><td>similarity</td><td>Checkpoint</td><td><span class="code">results/similarity/latest.pt</span></td></tr><tr><td>similarity</td><td>Metrics JSON</td><td><span class="code">results/similarity/train_metrics.json</span></td></tr><tr><td>similarity</td><td>Metrics JSON</td><td><span class="code">results/similarity/val_metrics.json</span></td></tr><tr><td>similarity</td><td>Metrics JSON</td><td><span class="code">results/similarity/test_metrics.json</span></td></tr><tr><td>similarity</td><td>Metrics CSV</td><td><span class="code">results/similarity/train_metrics.csv</span></td></tr><tr><td>similarity</td><td>Metrics CSV</td><td><span class="code">results/similarity/val_metrics.csv</span></td></tr><tr><td>similarity</td><td>Metrics CSV</td><td><span class="code">results/similarity/epoch_metrics.csv</span></td></tr><tr><td>similarity</td><td>Inference</td><td><span class="code">results/similarity/inference_topk.json</span></td></tr><tr><td>preference</td><td>Checkpoint</td><td><span class="code">results/preference/best.pt</span></td></tr><tr><td>preference</td><td>Checkpoint</td><td><span class="code">results/preference/latest.pt</span></td></tr><tr><td>preference</td><td>Metrics JSON</td><td><span class="code">results/preference/train_metrics.json</span></td></tr><tr><td>preference</td><td>Metrics JSON</td><td><span class="code">results/preference/val_metrics.json</span></td></tr><tr><td>preference</td><td>Metrics JSON</td><td><span class="code">results/preference/test_metrics.json</span></td></tr><tr><td>preference</td><td>Metrics CSV</td><td><span class="code">results/preference/train_metrics.csv</span></td></tr><tr><td>preference</td><td>Metrics CSV</td><td><span class="code">results/preference/val_metrics.csv</span></td></tr><tr><td>preference</td><td>Metrics CSV</td><td><span class="code">results/preference/epoch_metrics.csv</span></td></tr><tr><td>preference</td><td>Inference</td><td><span class="code">results/preference/inference_topk.json</span></td></tr><tr><td>global</td><td>Summary</td><td><span class="code">results/results_summary.json</span></td></tr><tr><td>global</td><td>Summary</td><td><span class="code">results/results_summary.csv</span></td></tr><tr><td>global</td><td>Report</td><td><span class="code">results/report.html</span></td></tr><tr><td>global</td><td>Plot</td><td><span class="code">results/plots/preference_train_loss.png</span></td></tr><tr><td>global</td><td>Plot</td><td><span class="code">results/plots/preference_val_mrr.png</span></td></tr><tr><td>global</td><td>Plot</td><td><span class="code">results/plots/preference_val_score_at_1.png</span></td></tr><tr><td>global</td><td>Plot</td><td><span class="code">results/plots/similarity_train_loss.png</span></td></tr><tr><td>global</td><td>Plot</td><td><span class="code">results/plots/similarity_val_mrr.png</span></td></tr><tr><td>global</td><td>Plot</td><td><span class="code">results/plots/similarity_val_score_at_1.png</span></td></tr></tbody></table></div></section>
+    <section class="section">
+      <h2>Observations and Caveats</h2>
+      <div class="two-col">
+        <div class="subsection">
+          <h4>What stands out</h4>
+          <ul>
+            <li>The preference model delivered the strongest validation Score@1 (<strong>0.3125</strong>) and the strongest test Score@1 (<strong>0.2615</strong>).</li>
+            <li>The similarity model retained a small edge on test MRR (<strong>0.3898</strong>).</li>
+            <li>The absolute gap in test Score@1 between the two runs was small (0.0051), so the ranking order is directionally useful but not decisive.</li>
+          </ul>
+        </div>
+        <div class="subsection">
+          <h4>How to interpret the results</h4>
+          <ul>
+            <li>These results come from reduced runs, not exhaustive tuning or multiple seeds.</li>
+            <li>The report reflects saved experiment outputs only; it does not infer unrun settings or hidden gains.</li>
+            <li>Validation curves suggest some instability after the best epoch, so longer runs would need careful checkpoint selection and probably broader tuning.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+</div></body></html>

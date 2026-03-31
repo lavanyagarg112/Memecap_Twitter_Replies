@@ -1,0 +1,13 @@
+Epoch 1 Train: loss=0.9964 | score_at_1=0.2703 | recall_at_1=0.1111 | mrr=0.3334 | ndcg_at_k=0.4922 | consensus_hit_rate=0.1228
+Epoch 1 Val: loss=1.0074 | score_at_1=0.2240 | recall_at_1=0.0938 | mrr=0.3116 | ndcg_at_k=0.4734 | consensus_hit_rate=0.0938
+Saved new best checkpoint to results/preference/best.pt with score_at_1=0.2240
+Epoch 2 Train: loss=0.9659 | score_at_1=0.2774 | recall_at_1=0.1014 | mrr=0.3455 | ndcg_at_k=0.5217 | consensus_hit_rate=0.1111
+Epoch 2 Val: loss=1.0167 | score_at_1=0.1771 | recall_at_1=0.1094 | mrr=0.3145 | ndcg_at_k=0.4476 | consensus_hit_rate=0.0625
+Epoch 3 Train: loss=0.9289 | score_at_1=0.2891 | recall_at_1=0.1423 | mrr=0.3716 | ndcg_at_k=0.5441 | consensus_hit_rate=0.1248
+Epoch 3 Val: loss=0.9967 | score_at_1=0.2187 | recall_at_1=0.1250 | mrr=0.3271 | ndcg_at_k=0.4717 | consensus_hit_rate=0.0938
+Epoch 4 Train: loss=0.8837 | score_at_1=0.3518 | recall_at_1=0.1969 | mrr=0.4221 | ndcg_at_k=0.5915 | consensus_hit_rate=0.1559
+Epoch 4 Val: loss=0.9811 | score_at_1=0.3125 | recall_at_1=0.1406 | mrr=0.3474 | ndcg_at_k=0.4944 | consensus_hit_rate=0.1562
+Saved new best checkpoint to results/preference/best.pt with score_at_1=0.3125
+Epoch 5 Train: loss=0.8121 | score_at_1=0.4084 | recall_at_1=0.2339 | mrr=0.4634 | ndcg_at_k=0.6453 | consensus_hit_rate=0.2047
+Epoch 5 Val: loss=1.0168 | score_at_1=0.2917 | recall_at_1=0.1406 | mrr=0.3514 | ndcg_at_k=0.4964 | consensus_hit_rate=0.1719
+Best Checkpoint Test: loss=0.9797 | score_at_1=0.2615 | recall_at_1=0.1692 | mrr=0.3774 | ndcg_at_k=0.5209 | consensus_hit_rate=0.1692

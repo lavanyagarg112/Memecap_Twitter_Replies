@@ -1,0 +1,7 @@
+Split=test
+loss: 0.9887
+score_at_1: 0.2564
+recall_at_1: 0.1692
+mrr: 0.3898
+ndcg_at_k: 0.4870
+consensus_hit_rate: 0.1077
