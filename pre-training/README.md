@@ -4,12 +4,19 @@
 
 Alternative pipeline using real tweets from [HSDSLab/TwitterMemes](https://huggingface.co/datasets/HSDSLab/TwitterMemes) instead of synthetic ones. Uses a VLM to describe each tweet+meme, then ranks the top 10 most semantically similar MemeCap memes via embedding similarity. No human annotation needed.
 
+#### How it works
+
+1. **Phase 1 — VLM Description**: `seed-1.6-flash` describes each tweet+meme image semantically (cached for resumability)
+2. **Phase 2 — Embedding Pool**: `all-MiniLM-L6-v2` embeds descriptions and builds a candidate pool (default top-20) by cosine similarity
+3. **Phase 3 — VLM Selection**: `seed-1.6-flash` selects the best 10 candidates from the pool
+4. **Phase 4 — VLM Ranking** (optional, `--rerank`): `gemini-3-flash` ranks those 10 candidates from most to least similar
+
 ```bash
 cd non-annotation
 pip install datasets Pillow
 python rank_similar_memes.py --limit 500 --dry-run   # check cost
 python rank_similar_memes.py --limit 500              # run (~$0.10)
-python rank_similar_memes.py --rerank                 # optional VLM re-ranking
+python rank_similar_memes.py --rerank                 # VLM re-ranking with Gemini
 python view_rankings.py                               # visualise results (localhost:5002)
 ```
 

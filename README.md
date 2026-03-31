@@ -27,11 +27,12 @@ project/
 
 ### Pipeline A: Non-Annotation (primary)
 
-Uses real tweets from [HSDSLab/TwitterMemes](https://huggingface.co/datasets/HSDSLab/TwitterMemes). A VLM describes each tweet+meme, then the top 10 most semantically similar MemeCap memes are ranked via embedding similarity. No human annotation required.
+Uses real tweets from [HSDSLab/TwitterMemes](https://huggingface.co/datasets/HSDSLab/TwitterMemes). A VLM (`seed-1.6-flash`) describes each tweet+meme, then `all-MiniLM-L6-v2` builds a candidate pool via embedding similarity. The same VLM selects the top 10 from the pool. An optional final pass (`--rerank`) uses `gemini-3-flash` to rank those 10. No human annotation required.
 
 ```bash
 cd pre-training/non-annotation
 python rank_similar_memes.py --limit 500    # ~$0.10, ~15 min
+python rank_similar_memes.py --rerank       # with Gemini ranking pass
 python view_rankings.py                     # visualise at localhost:5002
 ```
 
