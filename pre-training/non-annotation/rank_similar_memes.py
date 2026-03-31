@@ -3,18 +3,18 @@
 Non-annotation pipeline: Rank MemeCap memes by semantic similarity
 to real tweets from HSDSLab/TwitterMemes, powered by a VLM.
 
-Phase 1  VLM describes each tweet + meme image  (parallel, I/O-bound)
-Phase 2  Batch-embed descriptions -> cosine sim  (single-thread, fast)
-Phase 3  (--rerank) VLM re-ranks top candidates  (parallel, I/O-bound)
-Phase 4  Write train/val/test CSVs (same format as annotation pipeline)
+Phase 1  VLM describes each tweet + meme image              (parallel, I/O-bound)
+Phase 2  Batch-embed descriptions -> candidate pool         (single-thread, fast)
+Phase 3  VLM chooses the best 10 from the candidate pool    (parallel, I/O-bound)
+Phase 4  Second VLM ranks the chosen 10                     (parallel, I/O-bound)
+Phase 5  Write train/val/test CSVs                          (same format as annotation pipeline)
 
 Install:
     pip install datasets requests numpy sentence-transformers python-dotenv Pillow
 
 Usage:
     python rank_similar_memes.py                        # default 4 workers
-    python rank_similar_memes.py --workers 6 --limit 500
-    python rank_similar_memes.py --rerank               # VLM re-ranking pass
+    python rank_similar_memes.py --workers 6 --limit 1000
     python rank_similar_memes.py --dry-run              # cost estimate only
 """
 
@@ -47,11 +47,21 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 HTTP_REFERER = "http://localhost"
 APP_TITLE = "twitter-meme-ranker"
 
-# Cheapest vision-capable model on OpenRouter
+# Cheapest vision-capable model on OpenRouter (Phase 1: descriptions)
 VLM_MODEL = {
     "id": "bytedance-seed/seed-1.6-flash",
     "cost_per_1m_input": 0.075,
     "cost_per_1m_output": 0.30,
+}
+
+# Same fast model for Phase 3 candidate selection
+SELECT_MODEL = VLM_MODEL
+
+# Stronger model for Phase 4 final ranking
+RERANK_MODEL = {
+    "id": "google/gemini-3-flash-preview",
+    "cost_per_1m_input": 0.50,
+    "cost_per_1m_output": 3.00,
 }
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
@@ -59,7 +69,7 @@ MEMECAP_URL = "https://raw.githubusercontent.com/eujhwang/meme-cap/main/data/mem
 FLAGGED_FILE = Path(__file__).resolve().parent.parent / "flagged_memes.json"
 
 TOP_K = 10
-RERANK_POOL = 30  # candidates sent to VLM re-ranking
+DEFAULT_CANDIDATE_POOL = 20  # embedding shortlist sent to the VLM chooser
 
 # Conservative default — another parallel job may be running on this machine.
 # Increase if machine is free (e.g. --workers 12).
@@ -70,8 +80,10 @@ MAX_RETRIES = 2
 # Token estimates for cost calculation (image tokens counted separately by API)
 EST_INPUT_TOKENS_DESCRIBE = 1800
 EST_OUTPUT_TOKENS_DESCRIBE = 200
-EST_INPUT_TOKENS_RERANK = 3500
-EST_OUTPUT_TOKENS_RERANK = 300
+EST_INPUT_TOKENS_SELECT = 7000
+EST_OUTPUT_TOKENS_SELECT = 120
+EST_INPUT_TOKENS_RERANK = 5000
+EST_OUTPUT_TOKENS_RERANK = 180
 
 OUTPUT_FILE = "twitter_meme_rankings.jsonl"
 DESCRIPTIONS_CACHE = ".descriptions_cache.jsonl"
@@ -139,24 +151,32 @@ def get_image_url(row: dict) -> Optional[str]:
 
 
 def call_openrouter(prompt: str, image_url: Optional[str] = None,
-                    max_tokens: int = 250) -> str:
+                    max_tokens: int = 250, model: Optional[Dict] = None) -> str:
     """Send a request to OpenRouter. Includes image if provided."""
+    if image_url:
+        content: Any = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
+    else:
+        content = prompt
+    return call_openrouter_content(content, max_tokens=max_tokens, model=model)
+
+
+def call_openrouter_content(content: Any, max_tokens: int = 250,
+                            model: Optional[Dict] = None) -> str:
+    """Send a raw multimodal content payload to OpenRouter."""
+    if model is None:
+        model = VLM_MODEL
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": HTTP_REFERER,
         "X-Title": APP_TITLE,
     }
-    if image_url:
-        content = [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": image_url}},
-        ]
-    else:
-        content = prompt
 
     payload = {
-        "model": VLM_MODEL["id"],
+        "model": model["id"],
         "messages": [{"role": "user", "content": content}],
         "temperature": 0.3,
         "max_tokens": max_tokens,
@@ -172,26 +192,65 @@ def call_openrouter(prompt: str, image_url: Optional[str] = None,
             if not c:
                 raise ValueError("Empty response")
             return c.strip()
-        except Exception as e:
+        except Exception:
             if attempt < MAX_RETRIES - 1:
                 time.sleep(2 ** attempt)
             else:
                 raise
 
 
-def estimate_cost(n_tweets: int, rerank: bool) -> float:
-    """Estimate total API cost in USD."""
-    desc_cost = n_tweets * (
+def description_cost_per_tweet() -> float:
+    return (
         (EST_INPUT_TOKENS_DESCRIBE / 1_000_000) * VLM_MODEL["cost_per_1m_input"]
         + (EST_OUTPUT_TOKENS_DESCRIBE / 1_000_000) * VLM_MODEL["cost_per_1m_output"]
     )
-    rerank_cost = 0.0
-    if rerank:
-        rerank_cost = n_tweets * (
-            (EST_INPUT_TOKENS_RERANK / 1_000_000) * VLM_MODEL["cost_per_1m_input"]
-            + (EST_OUTPUT_TOKENS_RERANK / 1_000_000) * VLM_MODEL["cost_per_1m_output"]
-        )
-    return desc_cost + rerank_cost
+
+
+def selection_cost_per_tweet() -> float:
+    return (
+        (EST_INPUT_TOKENS_SELECT / 1_000_000) * SELECT_MODEL["cost_per_1m_input"]
+        + (EST_OUTPUT_TOKENS_SELECT / 1_000_000) * SELECT_MODEL["cost_per_1m_output"]
+    )
+
+
+def ranking_cost_per_tweet() -> float:
+    return (
+        (EST_INPUT_TOKENS_RERANK / 1_000_000) * RERANK_MODEL["cost_per_1m_input"]
+        + (EST_OUTPUT_TOKENS_RERANK / 1_000_000) * RERANK_MODEL["cost_per_1m_output"]
+    )
+
+
+def row_cost(tweet_id: str, cached_ids: set) -> float:
+    cost = selection_cost_per_tweet() + ranking_cost_per_tweet()
+    if tweet_id not in cached_ids:
+        cost += description_cost_per_tweet()
+    return cost
+
+
+def estimate_cost(rows: List[Dict[str, Any]], cached_ids: set) -> float:
+    """Estimate total API cost in USD for the rows in scope."""
+    total = 0.0
+    for i, row in enumerate(rows):
+        tid = row.get("id", str(i))
+        total += row_cost(tid, cached_ids)
+    return total
+
+
+def fit_rows_to_budget(rows: List[Dict[str, Any]], cached_ids: set,
+                       budget_usd: float) -> Tuple[int, float]:
+    """Return how many rows from the front fit within the budget."""
+    total = 0.0
+    keep = 0
+    for i, row in enumerate(rows):
+        tid = row.get("id", str(i))
+        cost = row_cost(tid, cached_ids)
+        if keep > 0 and total + cost > budget_usd:
+            break
+        if keep == 0 and cost > budget_usd:
+            return 0, 0.0
+        total += cost
+        keep += 1
+    return keep, total
 
 
 # ========================= DATA LOADING =========================
@@ -269,11 +328,19 @@ def build_memecap_embeddings(
     return np.array(embs)
 
 
+_KEEP_FIELDS = {"id", "post_text", "ocr", "img_link"}
+
+
 def load_twitter_memes(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """Load TwitterMemes from HuggingFace using streaming to avoid disk usage.
 
     The full dataset is ~11GB (images embedded in parquet). Streaming fetches
     rows on demand without caching to disk.
+
+    Only text fields + img_link are kept; the heavy PIL 'image' is discarded
+    immediately to avoid OOM on large runs.  For uncached tweets that still
+    need Phase 1 descriptions, get_image_url() will fetch the image on
+    demand from img_link.
     """
     from datasets import load_dataset
 
@@ -281,14 +348,25 @@ def load_twitter_memes(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     ds = load_dataset("HSDSLab/TwitterMemes", split="train", streaming=True)
 
     rows = []
-    for i, row in enumerate(ds):
-        if limit and i >= limit:
-            break
-        rows.append(row)
-        if (i + 1) % 500 == 0:
-            print(f"    streamed {i + 1} tweets ...")
+    iterator = iter(ds)
+    try:
+        for i, row in enumerate(iterator):
+            if limit and i >= limit:
+                break
+            # Keep only lightweight text fields — drop PIL image immediately
+            slim = {k: row[k] for k in _KEEP_FIELDS if k in row}
+            rows.append(slim)
+            if (i + 1) % 500 == 0:
+                print(f"    streamed {i + 1} tweets ({len(rows)} kept) ...")
+    finally:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
-    print(f"  Loaded {len(rows)} tweets via streaming.")
+    print(f"  Loaded {len(rows)} tweets (text-only).")
     return rows
 
 
@@ -335,7 +413,7 @@ def load_description_cache(cache_path: Path) -> Dict[str, str]:
 
 
 def run_phase1(
-    twitter_ds, cache_path: Path, workers: int, budget_tweets: int,
+    twitter_ds, cache_path: Path, workers: int,
 ) -> Dict[str, str]:
     """Phase 1: Generate VLM descriptions in parallel. Resumable."""
     cache = load_description_cache(cache_path)
@@ -348,9 +426,6 @@ def run_phase1(
         tid = twitter_ds[i].get("id", str(i))
         if tid not in cache:
             todo.append(i)
-
-    if len(todo) > budget_tweets:
-        todo = todo[:budget_tweets]
 
     if not todo:
         print("  Phase 1: all descriptions cached — skipping.")
@@ -411,7 +486,7 @@ def run_phase2(
     top_k: int,
 ) -> List[dict]:
     """Phase 2: Batch-embed descriptions and compute top-K similar memes."""
-    print(f"  Phase 2: embedding {len(descriptions)} descriptions ...")
+    print(f"  Phase 2: building embedding candidate pools ...")
 
     # Build aligned arrays
     tweet_ids = []
@@ -452,6 +527,7 @@ def run_phase2(
             meme = memecap_data[idx]
             ranked_memes.append({
                 "rank": rank + 1,
+                "embedding_rank": rank + 1,
                 "memecap_idx": int(idx),
                 "memecap_post_id": meme.get("post_id", ""),
                 "title": meme.get("title", ""),
@@ -468,15 +544,16 @@ def run_phase2(
             "img_link": tweet_img_links.get(tid, ""),
             "tweet_description": descriptions[tid],
             "top_memes": ranked_memes,
+            "selection_stage_method": "embedding_pool",
         })
 
     print(f"  Phase 2 complete: {len(results)} tweets ranked.\n")
     return results
 
 
-# ========================= PHASE 3: VLM RE-RANKING =========================
+# ========================= PHASE 3: VLM SELECTION =========================
 
-RERANK_PROMPT = """You are ranking memes by semantic similarity to an original tweet+meme.
+SELECT_PROMPT = """You are screening meme candidates for semantic similarity to an original tweet and meme image.
 
 Original tweet: "{post_text}"
 Original meme description: "{description}"
@@ -484,156 +561,300 @@ Original meme description: "{description}"
 Candidate memes (numbered):
 {candidates_text}
 
-Which candidates are most semantically similar to the original tweet+meme?
-Consider topic, humor style, emotional tone, and cultural references.
+Select the {top_k} candidates that are the strongest semantic matches.
+Consider topic, humor style, emotional tone, cultural references, and visual template.
 
-Return ONLY a JSON array of the top {top_k} candidate numbers, most similar first.
+Return ONLY a JSON array of exactly {top_k} candidate numbers.
 Example: [3, 7, 1, 5, 9, 2, 8, 4, 10, 6]"""
 
 
-def rerank_one(
+RERANK_PROMPT = """You are ranking meme candidates by semantic similarity to an original tweet and meme image.
+
+Original tweet: "{post_text}"
+Original meme description: "{description}"
+
+Candidate memes (numbered):
+{candidates_text}
+
+Rank all {top_k} candidates from most similar to least similar.
+Consider topic, humor style, emotional tone, cultural references, and visual template.
+
+Return ONLY a JSON array of all {top_k} candidate numbers, most similar first.
+Example: [3, 7, 1, 5, 9, 2, 8, 4, 10, 6]"""
+
+
+def truncate_text(text: str, limit: int = 360) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit - 3].rstrip() + "..."
+
+
+def build_candidate_text(meme: Dict[str, Any], display_idx: int,
+                         include_score: bool = False) -> str:
+    lines = [f"{display_idx}. {to_str(meme.get('title', '')) or '(untitled meme)'}"]
+    if include_score:
+        score = meme.get("similarity_score")
+        if score is not None:
+            lines.append(f"Embedding similarity: {score}")
+    summary = truncate_text(build_meme_text(meme))
+    if summary:
+        lines.append(f"Summary: {summary}")
+    return "\n".join(lines)
+
+
+def build_candidate_blocks(prompt: str, original_img_url: Optional[str],
+                           candidates: List[Dict[str, Any]],
+                           include_score: bool = False) -> List[Dict[str, Any]]:
+    blocks = [{"type": "text", "text": prompt}]
+    if original_img_url:
+        blocks.append({"type": "text", "text": "Original meme image:"})
+        blocks.append({"type": "image_url", "image_url": {"url": original_img_url}})
+
+    for i, meme in enumerate(candidates, start=1):
+        blocks.append({
+            "type": "text",
+            "text": build_candidate_text(meme, i, include_score=include_score),
+        })
+        image_url = to_str(meme.get("image_url", ""))
+        if image_url:
+            blocks.append({"type": "image_url", "image_url": {"url": image_url}})
+    return blocks
+
+
+def parse_number_array(response: str) -> List[int]:
+    match = re.search(r"\[[^\]]*\]", response, flags=re.S)
+    if not match:
+        return []
+    try:
+        arr = json.loads(match.group())
+    except Exception:
+        return []
+    if not isinstance(arr, list):
+        return []
+
+    nums = []
+    for item in arr:
+        try:
+            nums.append(int(item))
+        except Exception:
+            continue
+    return nums
+
+
+def normalize_candidate_positions(nums: List[int], n_candidates: int,
+                                  keep: int) -> List[int]:
+    result = []
+    seen = set()
+    for n in nums:
+        pos = n - 1
+        if 0 <= pos < n_candidates and pos not in seen:
+            result.append(pos)
+            seen.add(pos)
+        if len(result) >= keep:
+            return result[:keep]
+
+    for pos in range(n_candidates):
+        if pos not in seen:
+            result.append(pos)
+        if len(result) >= keep:
+            break
+    return result[:keep]
+
+
+def select_one(
     tweet_id: str,
     post_text: str,
     description: str,
-    candidates: List[Tuple[int, Dict[str, Any]]],
+    candidates: List[Dict[str, Any]],
     img_url: Optional[str],
-) -> Tuple[str, List[int]]:
-    """Use VLM to re-rank candidate memes. Returns (tweet_id, ordered indices)."""
-    lines = []
-    for i, (orig_idx, meme) in enumerate(candidates):
-        text = build_meme_text(meme)
-        lines.append(f"{i + 1}. {text}")
-    candidates_text = "\n".join(lines)
+) -> Tuple[str, List[Dict[str, Any]], str]:
+    """Use a VLM to choose the best 10 candidates from the embedding pool."""
+    if len(candidates) <= TOP_K:
+        selected = [dict(meme) for meme in candidates[:TOP_K]]
+        return tweet_id, selected, "embedding_topk"
 
-    prompt = RERANK_PROMPT.format(
+    lines = [build_candidate_text(meme, i + 1, include_score=True)
+             for i, meme in enumerate(candidates)]
+    prompt = SELECT_PROMPT.format(
         post_text=post_text,
         description=description,
-        candidates_text=candidates_text,
+        candidates_text="\n\n".join(lines),
         top_k=TOP_K,
     )
+    blocks = build_candidate_blocks(prompt, img_url, candidates, include_score=True)
 
+    method = "vlm_select"
     try:
-        response = call_openrouter(prompt, img_url, max_tokens=150)
-        match = re.search(r'\[[\d\s,]+\]', response)
-        if match:
-            nums = json.loads(match.group())
-            result = []
-            for n in nums:
-                if 1 <= n <= len(candidates):
-                    orig_idx = candidates[n - 1][0]
-                    if orig_idx not in result:
-                        result.append(orig_idx)
-            return tweet_id, result[:TOP_K]
+        response = call_openrouter_content(blocks, max_tokens=120, model=SELECT_MODEL)
+        positions = normalize_candidate_positions(
+            parse_number_array(response),
+            len(candidates),
+            TOP_K,
+        )
     except Exception:
-        pass
+        positions = list(range(TOP_K))
+        method = "embedding_topk"
 
-    # Fallback: keep embedding-based order
-    return tweet_id, [idx for idx, _ in candidates[:TOP_K]]
+    selected = []
+    for order, pos in enumerate(positions, start=1):
+        meme = dict(candidates[pos])
+        meme["selection_rank"] = order
+        selected.append(meme)
+    return tweet_id, selected, method
 
 
 def run_phase3(
     twitter_ds,
     phase2_results: List[dict],
-    memecap_data: List[Dict],
-    memecap_embeddings: np.ndarray,
-    embed_model: SentenceTransformer,
-    descriptions: Dict[str, str],
     workers: int,
 ) -> List[dict]:
-    """Phase 3: VLM re-ranks top-30 candidates down to top-10."""
-    print(f"  Phase 3: VLM re-ranking {len(phase2_results)} tweets "
+    """Phase 3: choose the best 10 candidates from the embedding pool."""
+    print(f"  Phase 3: VLM selecting top-{TOP_K} from each candidate pool "
           f"({workers} workers) ...")
 
-    # First, get top-RERANK_POOL candidates for each tweet (need broader set)
-    # Re-compute with larger pool
-    tweet_ids = []
-    query_texts = []
-    tweet_lookup = {}
-
-    for rec in phase2_results:
-        tid = rec["tweet_id"]
-        tweet_ids.append(tid)
-        query_texts.append(f"{rec['post_text']} {rec['tweet_description']}")
-        tweet_lookup[tid] = rec
-
-    query_embeddings = embed_model.encode(
-        query_texts, normalize_embeddings=True,
-    )
-    sim_matrix = np.array(query_embeddings) @ memecap_embeddings.T
-
-    # Build reranking tasks: (tweet_id, post_text, description, candidates)
-    rerank_tasks = []
-    for i, tid in enumerate(tweet_ids):
-        scores = sim_matrix[i]
-        top_indices = np.argsort(scores)[::-1][:RERANK_POOL]
-        candidates = [(int(idx), memecap_data[idx]) for idx in top_indices]
-        rec = tweet_lookup[tid]
-        rerank_tasks.append((tid, rec["post_text"], rec["tweet_description"], candidates))
-
-    # Build tweet_id -> dataset index mapping for image access
-    tid_to_dsidx = {}
+    tid_to_row = {}
     for i in range(len(twitter_ds)):
-        t = twitter_ds[i].get("id", str(i))
-        tid_to_dsidx[t] = i
+        tid_to_row[twitter_ds[i].get("id", str(i))] = twitter_ds[i]
 
-    write_lock = Lock()
+    selected = {}
+    methods = {}
     done = [0]
-    reranked = {}  # tweet_id -> ordered indices
+    write_lock = Lock()
 
-    def worker(task):
-        tid, post_text, description, candidates = task
-        # Try to get original meme image for visual context
-        img_url = None
-        ds_idx = tid_to_dsidx.get(tid)
-        if ds_idx is not None:
-            row = twitter_ds[ds_idx]
-            img_url = get_image_url(row)
-        return rerank_one(tid, post_text, description, candidates, img_url)
+    def worker(rec: Dict[str, Any]):
+        row = tid_to_row.get(rec["tweet_id"], {})
+        img_url = to_str(row.get("img_link", "")) or None
+        return select_one(
+            rec["tweet_id"],
+            rec["post_text"],
+            rec["tweet_description"],
+            rec["top_memes"],
+            img_url,
+        )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(worker, task): task[0] for task in rerank_tasks}
-
+        futures = {pool.submit(worker, rec): rec["tweet_id"] for rec in phase2_results}
         for future in as_completed(futures):
-            tid, ordered = future.result()
+            tid, chosen, method = future.result()
             with write_lock:
-                reranked[tid] = ordered
+                selected[tid] = chosen
+                methods[tid] = method
                 done[0] += 1
-            if done[0] % 100 == 0 or done[0] == len(rerank_tasks):
-                print(f"    Phase 3: [{done[0]}/{len(rerank_tasks)}]")
+            if done[0] % 100 == 0 or done[0] == len(phase2_results):
+                print(f"    Phase 3: [{done[0]}/{len(phase2_results)}]")
 
-    # Rebuild results with re-ranked order
     final_results = []
     for rec in phase2_results:
         tid = rec["tweet_id"]
-        if tid in reranked:
-            ordered_indices = reranked[tid]
-            # Get similarity scores from phase 2 for reference
-            i = tweet_ids.index(tid)
-            scores = sim_matrix[i]
+        new_rec = dict(rec)
+        new_rec["candidate_pool"] = [dict(meme) for meme in rec["top_memes"]]
+        new_rec["top_memes"] = selected.get(tid, [dict(m) for m in rec["top_memes"][:TOP_K]])
+        new_rec["selection_stage_method"] = methods.get(tid, "embedding_topk")
+        final_results.append(new_rec)
 
-            ranked_memes = []
-            for rank, idx in enumerate(ordered_indices):
-                meme = memecap_data[idx]
-                ranked_memes.append({
-                    "rank": rank + 1,
-                    "memecap_idx": int(idx),
-                    "memecap_post_id": meme.get("post_id", ""),
-                    "title": meme.get("title", ""),
-                    "image_url": meme.get("url", ""),
-                    "similarity_score": round(float(scores[idx]), 4),
-                    "img_captions": meme.get("img_captions", []),
-                    "meme_captions": meme.get("meme_captions", []),
-                    "metaphors": meme.get("metaphors", []),
-                })
-            rec = dict(rec)
-            rec["top_memes"] = ranked_memes
-        final_results.append(rec)
-
-    print(f"  Phase 3 complete: {len(reranked)} tweets re-ranked.\n")
+    print(f"  Phase 3 complete: {len(final_results)} tweets selected.\n")
     return final_results
 
 
-# ========================= PHASE 4: TRAIN/VAL/TEST CSVs =========================
+# ========================= PHASE 4: SECOND-VLM RANKING =========================
+
+def rerank_one(
+    tweet_id: str,
+    post_text: str,
+    description: str,
+    candidates: List[Dict[str, Any]],
+    img_url: Optional[str],
+) -> Tuple[str, List[Dict[str, Any]], str]:
+    """Use a second VLM to rank the 10 chosen candidates."""
+    lines = [build_candidate_text(meme, i + 1) for i, meme in enumerate(candidates)]
+    candidates_text = "\n\n".join(lines)
+
+    prompt = RERANK_PROMPT.format(
+        post_text=post_text,
+        description=description,
+        candidates_text=candidates_text,
+        top_k=len(candidates),
+    )
+    blocks = build_candidate_blocks(prompt, img_url, candidates, include_score=False)
+
+    method = "vlm_rank"
+    try:
+        response = call_openrouter_content(blocks, max_tokens=150, model=RERANK_MODEL)
+        positions = normalize_candidate_positions(
+            parse_number_array(response),
+            len(candidates),
+            len(candidates),
+        )
+    except Exception:
+        positions = list(range(len(candidates)))
+        method = "selection_order"
+
+    ranked = []
+    for rank, pos in enumerate(positions, start=1):
+        meme = dict(candidates[pos])
+        meme["rank"] = rank
+        ranked.append(meme)
+    return tweet_id, ranked, method
+
+
+def run_phase4(
+    twitter_ds,
+    phase2_results: List[dict],
+    workers: int,
+) -> List[dict]:
+    """Phase 4: second VLM ranks the 10 chosen candidates."""
+    print(f"  Phase 4: second-VLM ranking for {len(phase2_results)} tweets "
+          f"({workers} workers) ...")
+    tid_to_row = {}
+    for i in range(len(twitter_ds)):
+        tid_to_row[twitter_ds[i].get("id", str(i))] = twitter_ds[i]
+
+    write_lock = Lock()
+    done = [0]
+    reranked = {}
+    methods = {}
+
+    def worker(rec: Dict[str, Any]):
+        row = tid_to_row.get(rec["tweet_id"], {})
+        img_url = to_str(row.get("img_link", "")) or None
+        return rerank_one(
+            rec["tweet_id"],
+            rec["post_text"],
+            rec["tweet_description"],
+            rec["top_memes"],
+            img_url,
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(worker, rec): rec["tweet_id"] for rec in phase2_results}
+        for future in as_completed(futures):
+            tid, ranked, method = future.result()
+            with write_lock:
+                reranked[tid] = ranked
+                methods[tid] = method
+                done[0] += 1
+            if done[0] % 100 == 0 or done[0] == len(phase2_results):
+                print(f"    Phase 4: [{done[0]}/{len(phase2_results)}]")
+
+    final_results = []
+    for rec in phase2_results:
+        tid = rec["tweet_id"]
+        new_rec = dict(rec)
+        new_rec["selected_memes"] = [dict(meme) for meme in rec["top_memes"]]
+        new_rec["top_memes"] = reranked.get(tid, [dict(m) for m in rec["top_memes"]])
+        new_rec["ranking_stage_method"] = methods.get(tid, "selection_order")
+        new_rec["selection_method"] = (
+            f"{new_rec.get('selection_stage_method', 'unknown')}"
+            f"+{new_rec['ranking_stage_method']}"
+        )
+        final_results.append(new_rec)
+
+    print(f"  Phase 4 complete: {len(final_results)} tweets ranked.\n")
+    return final_results
+
+
+# ========================= PHASE 5: TRAIN/VAL/TEST CSVs =========================
 
 def format_captions(captions: Any) -> str:
     """Join list of captions into pipe-separated string (matches annotation pipeline)."""
@@ -660,12 +881,10 @@ def format_metaphors(metaphors: Any) -> str:
     return " | ".join(parts)
 
 
-def run_phase4(results: List[dict], script_dir: Path, rerank: bool):
-    """Phase 4: Convert ranked results to train/val/test CSVs
+def run_phase5(results: List[dict], script_dir: Path):
+    """Phase 5: Convert ranked results to train/val/test CSVs
     in the same format as the annotation pipeline."""
-    print("  Phase 4: generating train/val/test CSVs ...")
-
-    selection = "vlm_reranked" if rerank else "vlm_similarity"
+    print("  Phase 5: generating train/val/test CSVs ...")
 
     # Build flat rows grouped by task_id (= tweet_id)
     task_rows: Dict[str, List[dict]] = {}
@@ -682,7 +901,7 @@ def run_phase4(results: List[dict], script_dir: Path, rerank: bool):
                 "img_captions": format_captions(meme.get("img_captions")),
                 "meme_captions": format_captions(meme.get("meme_captions")),
                 "metaphors": format_metaphors(meme.get("metaphors")),
-                "selection_method": selection,
+                "selection_method": rec.get("selection_method", "vlm_select+vlm_rank"),
                 "candidate_index": meme["rank"] - 1,
                 "rank": meme["rank"],
                 "similarity_score": meme.get("similarity_score", 0.0),
@@ -718,7 +937,7 @@ def run_phase4(results: List[dict], script_dir: Path, rerank: bool):
         n_tasks = len(split_tasks)
         print(f"    {out_path.name:12s}: {n_tasks:6d} tasks, {len(rows):7d} rows")
 
-    print(f"  Phase 4 complete.\n")
+    print(f"  Phase 5 complete.\n")
 
 
 # ========================= MAIN =========================
@@ -726,7 +945,7 @@ def run_phase4(results: List[dict], script_dir: Path, rerank: bool):
 def main():
     parser = argparse.ArgumentParser(
         description="Rank MemeCap memes by similarity to TwitterMemes "
-                    "tweets using a VLM.",
+                    "tweets using an embedding pool plus two VLM passes.",
     )
     parser.add_argument(
         "--workers", type=int, default=DEFAULT_WORKERS,
@@ -742,8 +961,12 @@ def main():
         help="Max tweets to process (default: all 174k)",
     )
     parser.add_argument(
+        "--candidate-pool", type=int, default=DEFAULT_CANDIDATE_POOL,
+        help=f"Embedding shortlist size before VLM selection (default {DEFAULT_CANDIDATE_POOL})",
+    )
+    parser.add_argument(
         "--rerank", action="store_true",
-        help="Add VLM re-ranking pass over top-30 candidates (doubles API cost)",
+        help="Deprecated flag; VLM selection and ranking now always run.",
     )
     parser.add_argument(
         "--output", type=str, default=OUTPUT_FILE,
@@ -759,75 +982,95 @@ def main():
         print("ERROR: Set OPENROUTER_API_KEY in .env or environment.")
         sys.exit(1)
 
-    # ---- Load datasets ----
-    memecap = fetch_memecap()
+    if args.candidate_pool < TOP_K:
+        print(f"ERROR: --candidate-pool must be at least {TOP_K}.")
+        sys.exit(1)
 
-    print(f"\nLoading embedding model ({EMBEDDING_MODEL}) ...")
-    embed_model = SentenceTransformer(EMBEDDING_MODEL)
-    memecap_embeddings = build_memecap_embeddings(memecap, embed_model)
-
-    twitter_ds = load_twitter_memes(args.limit)
-    n_tweets = len(twitter_ds)
-
-    # ---- Check existing progress ----
+    # ---- Load cache and tweets first so budgeting is scoped correctly ----
     script_dir = Path(__file__).resolve().parent
     cache_path = script_dir / DESCRIPTIONS_CACHE
     output_path = script_dir / args.output
 
     cached = load_description_cache(cache_path)
-    n_cached = len(cached)
+    cached_ids = set(cached.keys())
+
+    twitter_ds = load_twitter_memes(args.limit)
+    n_tweets = len(twitter_ds)
+    n_cached = sum(
+        1
+        for i, row in enumerate(twitter_ds)
+        if row.get("id", str(i)) in cached_ids
+    )
     n_remaining = n_tweets - n_cached
 
     # ---- Cost estimate ----
-    est_cost = estimate_cost(n_remaining, args.rerank)
+    est_cost = estimate_cost(twitter_ds, cached_ids)
     print(f"\n{'=' * 55}")
     print(f"  VLM model:   {VLM_MODEL['id']}")
+    print(f"  Select:      {SELECT_MODEL['id']}")
+    print(f"  Rank:        {RERANK_MODEL['id']}")
     print(f"  Tweets:      {n_remaining} remaining / {n_tweets} total "
           f"({n_cached} cached)")
     print(f"  Workers:     {args.workers}")
-    print(f"  Re-rank:     {'YES (top-30 -> top-10)' if args.rerank else 'no'}")
+    print(f"  Candidate pool: {args.candidate_pool} -> {TOP_K}")
     print(f"  Est. cost:   ${est_cost:.2f}")
     print(f"  Budget:      ${args.budget:.2f}")
     print(f"  Output:      {output_path}")
     print(f"{'=' * 55}\n")
 
     # Trim to budget
-    budget_tweets = n_remaining
-    if n_remaining > 0 and est_cost > args.budget:
-        cost_per_tweet = est_cost / n_remaining
-        budget_tweets = int(args.budget / cost_per_tweet) if cost_per_tweet > 0 else 0
-        trimmed_cost = estimate_cost(budget_tweets, args.rerank)
+    budget_tweets = n_tweets
+    trimmed_cost = est_cost
+    if n_tweets > 0 and est_cost > args.budget:
+        budget_tweets, trimmed_cost = fit_rows_to_budget(twitter_ds, cached_ids, args.budget)
         print(f"  Budget cap: trimming to {budget_tweets} tweets "
               f"(~${trimmed_cost:.2f}).\n")
+
+    if budget_tweets < n_tweets:
+        twitter_ds = twitter_ds[:budget_tweets]
+        n_tweets = len(twitter_ds)
+        n_cached = sum(
+            1
+            for i, row in enumerate(twitter_ds)
+            if row.get("id", str(i)) in cached_ids
+        )
+        n_remaining = n_tweets - n_cached
 
     if args.dry_run:
         print("Dry run complete — exiting.")
         return
 
-    if budget_tweets == 0 and n_cached == 0:
+    if n_tweets == 0:
         print("Nothing to process.")
         return
 
+    # ---- Load datasets and embeddings ----
+    memecap = fetch_memecap()
+
+    print(f"\nLoading embedding model ({EMBEDDING_MODEL}) ...")
+    embed_model = SentenceTransformer(EMBEDDING_MODEL)
+    memecap_embeddings = build_memecap_embeddings(memecap, embed_model)
+
     # ---- Phase 1: VLM descriptions ----
-    descriptions = run_phase1(twitter_ds, cache_path, args.workers, budget_tweets)
+    descriptions = run_phase1(twitter_ds, cache_path, args.workers)
 
     if not descriptions:
         print("No descriptions generated — exiting.")
         return
 
-    # ---- Phase 2: Embedding similarity ----
-    top_k = RERANK_POOL if args.rerank else TOP_K
+    # ---- Phase 2: Embedding candidate pool ----
     results = run_phase2(
         twitter_ds, descriptions, embed_model,
-        memecap_embeddings, memecap, top_k,
+        memecap_embeddings, memecap, args.candidate_pool,
     )
 
-    # ---- Phase 3: VLM re-ranking (optional) ----
-    if args.rerank and results:
-        results = run_phase3(
-            twitter_ds, results, memecap, memecap_embeddings,
-            embed_model, descriptions, args.workers,
-        )
+    # ---- Phase 3: VLM selection ----
+    if results:
+        results = run_phase3(twitter_ds, results, args.workers)
+
+    # ---- Phase 4: second-VLM ranking ----
+    if results:
+        results = run_phase4(twitter_ds, results, args.workers)
 
     # ---- Save JSONL (intermediate / inspection) ----
     for rec in results:
@@ -837,8 +1080,8 @@ def main():
         for rec in results:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    # ---- Phase 4: Train/val/test CSVs ----
-    run_phase4(results, script_dir, args.rerank)
+    # ---- Phase 5: Train/val/test CSVs ----
+    run_phase5(results, script_dir)
 
     print(f"{'=' * 55}")
     print(f"  DONE: {len(results)} tweets with top-{TOP_K} meme rankings")
