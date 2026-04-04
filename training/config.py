@@ -101,7 +101,7 @@ def parse_args() -> Config:
     parser.add_argument("--unk_token", type=str, default=config.text.unk_token)
     parser.add_argument("--pad_token", type=str, default=config.text.pad_token)
 
-    parser.add_argument("--model_type", type=str, choices=["similarity", "preference"], default=config.model.model_type)
+    parser.add_argument("--model_type", type=str, choices=["similarity", "preference", "image", "multimodal"], default=config.model.model_type)
     parser.add_argument("--text_encoder_type", type=str, choices=["bow_mean", "gru"], default=config.model.text_encoder_type)
     parser.add_argument("--embed_dim", type=int, default=config.model.embed_dim)
     parser.add_argument("--hidden_dim", type=int, default=config.model.hidden_dim)

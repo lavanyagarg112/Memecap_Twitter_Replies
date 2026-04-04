@@ -51,6 +51,9 @@ class Batch:
     candidate_ids: list[list[str]]
     metadata: list[list[dict]]
 
+    context_texts: list[str]
+    image_urls: list[list[str]]
+
 
 def load_csv_rows(csv_path: str) -> list[dict]:
     resolved_path = resolve_csv_path(csv_path)
@@ -233,6 +236,9 @@ def collate_fn(batch: list[TaskItem]) -> Batch:
         task_ids=task_ids,
         candidate_ids=candidate_ids,
         metadata=metadata,
+        
+        context_texts=[task.context_text for task in batch],
+        image_urls=[[meta.get("image_url", "") for meta in task.metadata] for task in batch],
     )
 
 
