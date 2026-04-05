@@ -1,30 +1,33 @@
 """
 3 pipelines are supported via --pipeline:
   text        tweet text  +  candidate text                   (HF / BOW / GRU)
-  image       tweet text  +  candidate image                  (CLIP)
-  multimodal  tweet text  +  candidate image + candidate text (CLIP + HF / LLaVA)
+  image       tweet text  +  candidate image                  (Qwen2.5-VL)
+  multimodal  tweet text  +  candidate image + candidate text (Qwen2.5-VL)
 
-4 text/vision backends via --encoder_type:
+4 backends are exposed via --encoder_type:
   hf        any HuggingFace sentence-transformer / BERT-style model
-  clip      CLIP text + vision towers (required for image / multimodal pipelines)
   bow_mean  bag-of-words mean-pooling baseline (no external download)
   gru       GRU encoder baseline               (no external download)
-  llava     LLaVA-style VLM  (multimodal pipeline only)
+  qwen_vl   Qwen2.5-VL cross-encoder           (image / multimodal pipelines)
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import List
+
+_TRAINING_DIR = Path(__file__).resolve().parent
+_NON_ANNOTATION_DIR = _TRAINING_DIR / "data" / "non-annotation-dataset" / "clean"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class DataConfig:
-    train_csv: str = "data/train.csv"
-    val_csv:   str = "data/val.csv"
-    test_csv:  str = "data/test.csv"
+    train_csv: str = str(_NON_ANNOTATION_DIR / "train_clean.csv")
+    val_csv:   str = str(_NON_ANNOTATION_DIR / "val_clean.csv")
+    test_csv:  str = str(_NON_ANNOTATION_DIR / "test_clean.csv")
 
     # Folder containing pre-downloaded images named <meme_post_id>.jpg/png.
     # Set to "" to fall back to downloading from image_url at runtime.
@@ -36,7 +39,7 @@ class DataConfig:
     )
 
     min_candidates_per_task: int = 2
-    max_candidates_per_task: int = 0   # 0 = use all (typically 10)
+    max_candidates_per_task: int = 0   # kept for checkpoint compatibility; runtime truncation is disabled
 
 
 @dataclass
@@ -51,14 +54,14 @@ class ModelConfig:
     pipeline: str = "text"        # "text" | "image" | "multimodal"
 
     # "hf"       --> HuggingFace AutoModel (text pipelines)
-    # "clip"     --> CLIP (image or multimodal)
     # "bow_mean" --> bag-of-words baseline
     # "gru"      --> GRU baseline
-    # "llava"    --> LLaVA VLM (multimodal only)
+    # "qwen_vl"  --> Qwen2.5-VL cross-encoder (image / multimodal pipelines)
     encoder_type: str = "hf"
 
     hf_model_name:    str = "sentence-transformers/all-MiniLM-L6-v2"
     clip_model_name:  str = "openai/clip-vit-base-patch32"
+    qwen_vl_model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     llava_model_name: str = "llava-hf/llava-1.5-7b-hf"
 
     ranker_type:   str = "preference"   # "similarity" | "preference"
@@ -136,16 +139,13 @@ def parse_args() -> Config:
                    help="Folder with pre-downloaded images. "
                         "Pass '' to download from image_url at runtime.")
     parser.add_argument("--min_candidates", type=int, default=cfg.data.min_candidates_per_task)
-    parser.add_argument("--max_candidates", type=int, default=cfg.data.max_candidates_per_task,
-                   help="Max candidates per task (0 = all).")
 
     parser.add_argument("--pipeline",      default=cfg.model.pipeline,
                    choices=["text", "image", "multimodal"])
     parser.add_argument("--encoder_type",  default=cfg.model.encoder_type,
-                   choices=["hf", "clip", "bow_mean", "gru", "llava"])
+                   choices=["hf", "bow_mean", "gru", "qwen_vl"])
     parser.add_argument("--hf_model",      default=cfg.model.hf_model_name)
-    parser.add_argument("--clip_model",    default=cfg.model.clip_model_name)
-    parser.add_argument("--llava_model",   default=cfg.model.llava_model_name)
+    parser.add_argument("--qwen_vl_model", default=cfg.model.qwen_vl_model_name)
     parser.add_argument("--ranker_type",   default=cfg.model.ranker_type,
                    choices=["similarity", "preference"])
     parser.add_argument("--proj_dim",      type=int, default=cfg.model.proj_dim)
@@ -178,13 +178,12 @@ def parse_args() -> Config:
     cfg.data.test_csv                = args.test_csv
     cfg.data.image_dir               = args.image_dir
     cfg.data.min_candidates_per_task = args.min_candidates
-    cfg.data.max_candidates_per_task = args.max_candidates
+    cfg.data.max_candidates_per_task = 0
 
     cfg.model.pipeline         = args.pipeline
     cfg.model.encoder_type     = args.encoder_type
     cfg.model.hf_model_name    = args.hf_model
-    cfg.model.clip_model_name  = args.clip_model
-    cfg.model.llava_model_name = args.llava_model
+    cfg.model.qwen_vl_model_name = args.qwen_vl_model
     cfg.model.ranker_type      = args.ranker_type
     cfg.model.proj_dim         = args.proj_dim
     cfg.model.freeze_encoder   = args.freeze_encoder
@@ -206,5 +205,16 @@ def parse_args() -> Config:
     cfg.train.use_amp      = not args.no_amp
 
     cfg.eval.ndcg_k = args.ndcg_k
+
+    valid_text_encoders = {"hf", "bow_mean", "gru"}
+    if cfg.model.pipeline == "text":
+        if cfg.model.encoder_type not in valid_text_encoders:
+            parser.error("--pipeline text only supports --encoder_type in {hf, bow_mean, gru}.")
+    else:
+        if cfg.model.encoder_type != "qwen_vl":
+            parser.error(f"--pipeline {cfg.model.pipeline} requires --encoder_type qwen_vl.")
+
+    if cfg.model.encoder_type == "qwen_vl" and cfg.model.ranker_type != "preference":
+        parser.error("--encoder_type qwen_vl requires --ranker_type preference.")
 
     return cfg

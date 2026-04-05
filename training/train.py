@@ -8,14 +8,11 @@
   # Pipeline 1 — GRU baseline
   python train.py --pipeline text --encoder_type gru
 
-  # Pipeline 2 — image only (CLIP)
-  python train.py --pipeline image --encoder_type clip --image_dir data/images
+  # Pipeline 2 — image only (Qwen2.5-VL cross-encoder)
+  python train.py --pipeline image --encoder_type qwen_vl --image_dir data/images
 
-  # Pipeline 3 — multimodal CLIP + HF text
-  python train.py --pipeline multimodal --encoder_type hf --image_dir data/images
-
-  # Pipeline 3 — multimodal LLaVA  (GPU with ~14 GB VRAM recommended)
-  python train.py --pipeline multimodal --encoder_type llava --freeze_encoder
+  # Pipeline 3 — multimodal Qwen2.5-VL cross-encoder
+  python train.py --pipeline multimodal --encoder_type qwen_vl --image_dir data/images
 
   # Override data paths
   python train.py --train_csv data/train.csv --val_csv data/val.csv --test_csv data/test.csv

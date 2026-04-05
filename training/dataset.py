@@ -62,9 +62,42 @@ class Batch:
     candidate_input_ids:     Optional[torch.Tensor]
     candidate_attention_mask: Optional[torch.Tensor]
     pixel_values:            Optional[torch.Tensor]
+    image_grid_thw:          Optional[torch.Tensor]
     candidate_mask:          torch.Tensor    # [B, K]  real=1, pad=0
     ranks:                   torch.Tensor    # [B, K]
     task_ids:                List[str]
+
+
+def _build_qwen_pair_prompt(
+    processor,
+    tweet_text: str,
+    candidate_text: str = "",
+) -> str:
+    prompt = [f"Tweet:\n{tweet_text}"]
+    if candidate_text.strip():
+        prompt.append(f"Candidate meme text:\n{candidate_text}")
+        prompt.append(
+            "How suitable is this meme image and text together as a reply to the tweet?"
+        )
+    else:
+        prompt.append("How suitable is this meme image as a reply to the tweet?")
+    prompt_text = "\n\n".join(prompt)
+    if hasattr(processor, "apply_chat_template"):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt_text},
+                ],
+            }
+        ]
+        return processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    return prompt_text
 
 def _find_local_image(image_dir: str, meme_post_id: str) -> Optional[str]:
     for ext in (".jpg", ".jpeg", ".png", ".webp"):
@@ -144,7 +177,6 @@ class MemeDataset(Dataset):
         pipeline:       str,
         image_dir:      str  = "",
         min_candidates: int  = 2,
-        max_candidates: int  = 0,
     ):
         self.pipeline  = pipeline
         self.image_dir = image_dir
@@ -153,8 +185,6 @@ class MemeDataset(Dataset):
 
         for task in tasks:
             cands = task.candidates
-            if max_candidates > 0:
-                cands = cands[:max_candidates]
             if len(cands) < min_candidates:
                 continue
             if need_images:
@@ -174,11 +204,13 @@ class MemeDataset(Dataset):
 
 def make_collate_fn(
     pipeline:        str,
+    encoder_type:    Optional[str] = None,
     tokenizer=None,         # HF AutoTokenizer or CLIPProcessor
     image_processor=None,   # HF CLIPImageProcessor (when not using full CLIPProcessor)
     vocab=None,             # Vocab instance (BOW / GRU path)
     text_cfg=None,          # TextConfig
 ):
+    is_qwen_vl = encoder_type == "qwen_vl" and pipeline in ("image", "multimodal")
     need_text  = pipeline in ("text", "multimodal")
     need_image = pipeline in ("image", "multimodal")
     max_ctx    = text_cfg.max_context_len if text_cfg else 128
@@ -190,6 +222,7 @@ def make_collate_fn(
 
         ctx_texts    = [t.tweet_text for t in tasks]
         cand_texts   = []   # length B*K (padded slots get "")
+        pair_texts   = []   # length B*K for Qwen image mode
         images       = []   # length B*K
         ranks        = torch.full((B, K), fill_value=K + 1, dtype=torch.long)
         cand_mask    = torch.zeros(B, K, dtype=torch.long)
@@ -197,6 +230,14 @@ def make_collate_fn(
         for b, task in enumerate(tasks):
             for k, cand in enumerate(task.candidates):
                 cand_texts.append(cand.candidate_text)
+                if is_qwen_vl:
+                    pair_texts.append(
+                        _build_qwen_pair_prompt(
+                            tokenizer,
+                            task.tweet_text,
+                            cand.candidate_text if pipeline == "multimodal" else "",
+                        )
+                    )
                 if need_image:
                     images.append(
                         cand.image if cand.image is not None
@@ -206,12 +247,36 @@ def make_collate_fn(
                 cand_mask[b, k] = 1
             for k in range(len(task.candidates), K):
                 cand_texts.append("")
+                if is_qwen_vl:
+                    pair_texts.append(
+                        _build_qwen_pair_prompt(
+                            tokenizer,
+                            task.tweet_text,
+                            "",
+                        )
+                    )
                 if need_image:
                     images.append(Image.new("RGB", (224, 224)))
 
         ctx_ids = ctx_mask = cand_ids = cand_attn = None
+        pixel_values = image_grid_thw = None
 
-        if need_text and tokenizer is not None:
+        if is_qwen_vl:
+            out = tokenizer(
+                text=pair_texts,
+                images=images,
+                padding=True,
+                return_tensors="pt",
+            )
+            cand_ids  = out["input_ids"].view(B, K, -1)
+            cand_attn = out["attention_mask"].view(B, K, -1)
+            pv = out["pixel_values"]
+            pixel_values = pv.view(B, K, *pv.shape[1:])
+            if "image_grid_thw" in out:
+                grid = out["image_grid_thw"]
+                image_grid_thw = grid.view(B, K, -1)
+
+        elif need_text and tokenizer is not None:
             # HuggingFace tokenizer (AutoTokenizer or CLIPProcessor)
             ctx_enc = tokenizer(
                 ctx_texts,
@@ -235,8 +300,7 @@ def make_collate_fn(
             cand_ids  = flat_ids.view(B, K, -1)
             cand_attn = flat_mask.view(B, K, -1)
 
-        pixel_values = None
-        if need_image and images:
+        if need_image and images and not is_qwen_vl:
             proc = image_processor if image_processor is not None else tokenizer
             if proc is not None:
                 out = proc(images=images, return_tensors="pt")
@@ -249,6 +313,7 @@ def make_collate_fn(
             candidate_input_ids      = cand_ids,
             candidate_attention_mask = cand_attn,
             pixel_values             = pixel_values,
+            image_grid_thw           = image_grid_thw,
             candidate_mask           = cand_mask,
             ranks                    = ranks,
             task_ids                 = [t.task_id for t in tasks],
@@ -288,6 +353,7 @@ def load_datasets(config):
     global collate_fn
     collate_fn = make_collate_fn(
         pipeline        = pipeline,
+        encoder_type    = enc_type,
         tokenizer       = tokenizer,
         image_processor = image_processor,
         vocab           = vocab,
@@ -300,7 +366,6 @@ def load_datasets(config):
             pipeline       = pipeline,
             image_dir      = cfg.data.image_dir,
             min_candidates = cfg.data.min_candidates_per_task,
-            max_candidates = cfg.data.max_candidates_per_task,
         )
 
     return _ds(train_tasks), _ds(val_tasks), _ds(test_tasks), vocab
@@ -315,6 +380,7 @@ def _build_processors(cfg):
     hf           | text       | AutoTokenizer           | None
     hf           | multimodal | AutoTokenizer           | CLIPImageProcessor
     clip         | *          | CLIPProcessor           | CLIPProcessor
+    qwen_vl      | image/multimodal | AutoProcessor      | AutoProcessor
     bow_mean/gru | *          | None (use Vocab)        | CLIPImageProcessor?
     llava        | multimodal | LlavaProcessor          | LlavaProcessor
     """
@@ -334,6 +400,12 @@ def _build_processors(cfg):
     elif enc == "clip":
         from transformers import CLIPProcessor
         proc = CLIPProcessor.from_pretrained(cfg.model.clip_model_name)
+        tokenizer       = proc
+        image_processor = proc
+
+    elif enc == "qwen_vl":
+        from transformers import AutoProcessor
+        proc = AutoProcessor.from_pretrained(cfg.model.qwen_vl_model_name)
         tokenizer       = proc
         image_processor = proc
 

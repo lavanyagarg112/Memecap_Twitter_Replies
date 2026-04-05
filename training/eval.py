@@ -45,10 +45,10 @@ def main() -> None:
         pipeline       = cfg.model.pipeline,
         image_dir      = cfg.data.image_dir,
         min_candidates = cfg.data.min_candidates_per_task,
-        max_candidates = cfg.data.max_candidates_per_task,
     )
     collate = make_collate_fn(
         pipeline        = cfg.model.pipeline,
+        encoder_type    = cfg.model.encoder_type,
         tokenizer       = tokenizer,
         image_processor = image_processor,
         vocab           = vocab,

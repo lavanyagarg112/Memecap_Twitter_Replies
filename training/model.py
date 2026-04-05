@@ -132,6 +132,43 @@ class _LLaVAEncoder(nn.Module):
         return emb.float()
 
 
+class _QwenVLPairEncoder(nn.Module):
+    def __init__(self, model_name: str, freeze: bool = False):
+        super().__init__()
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype="auto",
+        )
+        self.out_dim = self.model.config.text_config.hidden_size
+        if freeze:
+            for p in self.model.parameters():
+                p.requires_grad_(False)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        out = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        last_hidden = out.hidden_states[-1]
+        seq_lens = attention_mask.sum(1) - 1
+        idx = seq_lens.clamp(min=0).unsqueeze(-1).unsqueeze(-1).expand(
+            -1, 1, last_hidden.size(-1)
+        )
+        emb = last_hidden.gather(1, idx).squeeze(1)
+        return emb.float()
+
+
 class _SimilarityRanker(nn.Module):
     def __init__(self, ctx_dim: int, cand_dim: int, proj_dim: int,
                  sim_fn: str = "cosine", dropout: float = 0.1):
@@ -188,7 +225,37 @@ class MemeRanker(nn.Module):
 
         self.pipeline  = pipeline
         self.enc_type  = enc_type
+        self.is_qwen_vl = enc_type == "qwen_vl" and pipeline in ("image", "multimodal")
         self.is_llava  = (enc_type == "llava")
+
+        if enc_type == "qwen_vl" and pipeline not in ("image", "multimodal"):
+            raise ValueError(
+                "encoder_type='qwen_vl' currently only supports pipeline='image' or 'multimodal'."
+            )
+
+        if self.is_qwen_vl:
+            if mcfg.ranker_type != "preference":
+                raise ValueError(
+                    "encoder_type='qwen_vl' only supports ranker_type='preference'."
+                )
+            self.ctx_enc = None
+            self.qwen_pair_enc = _QwenVLPairEncoder(mcfg.qwen_vl_model_name, freeze=freeze)
+            score_dim = mcfg.proj_dim if mcfg.proj_dim > 0 else self.qwen_pair_enc.out_dim
+            if score_dim == self.qwen_pair_enc.out_dim:
+                self.pair_proj = nn.Identity()
+            else:
+                self.pair_proj = _Proj(self.qwen_pair_enc.out_dim, score_dim, mcfg.dropout)
+            self.pair_scorer = nn.Sequential(
+                nn.Linear(score_dim, mcfg.mlp_hidden),
+                nn.LayerNorm(mcfg.mlp_hidden),
+                nn.GELU(),
+                nn.Dropout(mcfg.dropout),
+                nn.Linear(mcfg.mlp_hidden, 1),
+            )
+            self.cand_text_enc = None
+            self.cand_img_enc  = None
+            self.ranker = None
+            return
 
         self.ctx_enc = self._make_text_enc(mcfg, vocab_size, freeze)
 
@@ -250,6 +317,8 @@ class MemeRanker(nn.Module):
             return _BOWEncoder(vocab_size, mcfg.embed_dim)
         elif enc == "gru":
             return _GRUEncoder(vocab_size, mcfg.embed_dim, mcfg.hidden_dim)
+        elif enc == "qwen_vl":
+            raise ValueError("Qwen2.5-VL is only supported as an image/multimodal cross-encoder.")
         elif enc == "llava":
             return _CLIPTextEncoder(mcfg.clip_model_name, freeze)
         raise ValueError(f"Unknown encoder_type: {enc!r}")
@@ -289,6 +358,16 @@ class MemeRanker(nn.Module):
         return fused.view(B, K, -1)
 
     def forward(self, batch: Batch) -> torch.Tensor:
+        if self.is_qwen_vl:
+            B, K = batch.ranks.shape
+            flat_ids  = batch.candidate_input_ids.view(B * K, -1)
+            flat_mask = batch.candidate_attention_mask.view(B * K, -1)
+            flat_pv   = batch.pixel_values.view(B * K, *batch.pixel_values.shape[2:])
+            flat_grid = batch.image_grid_thw.view(B * K, -1)
+            emb = self.qwen_pair_enc(flat_ids, flat_mask, flat_pv, flat_grid)
+            scores = self.pair_scorer(self.pair_proj(emb)).view(B, K)
+            return scores.masked_fill(batch.candidate_mask <= 0, -1e9)
+
         ctx  = self._encode_context(batch)     # [B, D]
         cand = self._encode_candidates(batch)  # [B, K, D']
         return self.ranker(ctx, cand)          # [B, K]

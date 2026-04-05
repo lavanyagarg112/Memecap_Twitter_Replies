@@ -33,6 +33,7 @@ def move_batch_to_device(batch: Batch, device: torch.device) -> Batch:
     batch.candidate_input_ids      = _m(batch.candidate_input_ids)
     batch.candidate_attention_mask = _m(batch.candidate_attention_mask)
     batch.pixel_values             = _m(batch.pixel_values)
+    batch.image_grid_thw           = _m(batch.image_grid_thw)
     batch.candidate_mask           = batch.candidate_mask.to(device)
     batch.ranks                    = batch.ranks.to(device)
     return batch
