@@ -14,12 +14,15 @@ project/
 │   ├── annotate_parallel.py    # Multi-model VLM annotation (parallel)
 │   ├── create_train_data.py    # Generate train/val/test splits
 │   └── meme_rankings.csv       # Ranked meme candidates per tweet
-├── training/                   # Model training
-│   ├── data/
-│   │   ├── train.csv, val.csv, test.csv
-│   │   └── clean/
-│   │       └── train_clean.csv, val_clean.csv, test_clean.csv
-│   └── init.py
+├── training/                   # Reranker training
+│   ├── data/non-annotation-dataset/clean/
+│   │   ├── train_clean.csv
+│   │   ├── val_clean.csv
+│   │   └── test_clean.csv
+│   ├── download_images.py      # One-time image downloader
+│   ├── train.py                # Training entry point
+│   ├── eval.py                 # Checkpoint evaluation
+│   └── README.md               # Full training instructions
 └── README.md
 ```
 
@@ -48,7 +51,9 @@ Generate tweets → Clean → Flag memes → Select candidates → Human annotat
 
 ### Training Data
 
-Both pipelines output pointwise format — one row per tweet-meme pair. Shared columns:
+Both pipelines output one row per tweet-meme candidate pair. Training groups rows by `task_id` and reranks the fixed candidate set already stored in the CSV.
+
+Shared columns:
 
 | Column | Description |
 |--------|-------------|
@@ -68,6 +73,72 @@ Pipeline-specific columns:
 | vote counts | — | `num_votes`, `num_yes`, `num_no` |
 
 Split: 80/10/10 by task. Flagged inappropriate memes automatically excluded.
+
+## Training
+
+The training code currently assumes retrieval is already done offline. It uses the fixed candidate sets in:
+
+- `training/data/non-annotation-dataset/clean/train_clean.csv`
+- `training/data/non-annotation-dataset/clean/val_clean.csv`
+- `training/data/non-annotation-dataset/clean/test_clean.csv`
+
+The three intended training runs are:
+
+1. Text pipeline
+   tweet + candidate text
+
+2. Image pipeline
+   tweet + candidate image
+
+3. Multimodal pipeline
+   tweet + candidate image + candidate text
+
+Image and multimodal training use `Qwen/Qwen2.5-VL-3B-Instruct` as the VLM cross-encoder.
+
+### Training Quick Start
+
+From the repo root:
+
+```bash
+pip install -r training/requirements.txt
+python training/download_images.py
+```
+
+Smoke tests:
+
+```bash
+python training/train.py --pipeline text --encoder_type hf --device cuda --batch_size 16 --num_epochs 1 --save_dir training/checkpoints/text_hf_smoke
+```
+
+```bash
+python training/train.py --pipeline image --encoder_type qwen_vl --device cuda --batch_size 1 --freeze_encoder --num_epochs 1 --image_dir training/data/non-annotation-dataset/images --save_dir training/checkpoints/image_qwen_smoke
+```
+
+```bash
+python training/train.py --pipeline multimodal --encoder_type qwen_vl --device cuda --batch_size 1 --freeze_encoder --num_epochs 1 --image_dir training/data/non-annotation-dataset/images --save_dir training/checkpoints/multimodal_qwen_smoke
+```
+
+Full runs:
+
+```bash
+python training/train.py --pipeline text --encoder_type hf --device cuda --batch_size 16 --save_dir training/checkpoints/text_hf_clean
+```
+
+```bash
+python training/train.py --pipeline image --encoder_type qwen_vl --device cuda --batch_size 1 --freeze_encoder --image_dir training/data/non-annotation-dataset/images --save_dir training/checkpoints/image_qwen_clean
+```
+
+```bash
+python training/train.py --pipeline multimodal --encoder_type qwen_vl --device cuda --batch_size 1 --freeze_encoder --image_dir training/data/non-annotation-dataset/images --save_dir training/checkpoints/multimodal_qwen_clean
+```
+
+Evaluation:
+
+```bash
+python training/eval.py --checkpoint training/checkpoints/text_hf_clean/best.pt --split test --device cuda
+```
+
+See [`training/README.md`](training/README.md) for the full training workflow.
 
 ## Setup
 
