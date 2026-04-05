@@ -1,173 +1,210 @@
+"""
+3 pipelines are supported via --pipeline:
+  text        tweet text  +  candidate text                   (HF / BOW / GRU)
+  image       tweet text  +  candidate image                  (CLIP)
+  multimodal  tweet text  +  candidate image + candidate text (CLIP + HF / LLaVA)
+
+4 text/vision backends via --encoder_type:
+  hf        any HuggingFace sentence-transformer / BERT-style model
+  clip      CLIP text + vision towers (required for image / multimodal pipelines)
+  bow_mean  bag-of-words mean-pooling baseline (no external download)
+  gru       GRU encoder baseline               (no external download)
+  llava     LLaVA-style VLM  (multimodal pipeline only)
+"""
+
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, asdict
+from typing import List
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class DataConfig:
-    train_csv: str = "data/clean/train_clean.csv"
-    val_csv: str = "data/clean/val_clean.csv"
-    test_csv: str = "data/clean/test_clean.csv"
-    min_candidates_per_task: int = 2
-    candidate_text_fields: tuple[str, ...] = (
-        "meme_title",
-        "img_captions",
-        "meme_captions",
-        "metaphors",
+    train_csv: str = "data/train.csv"
+    val_csv:   str = "data/val.csv"
+    test_csv:  str = "data/test.csv"
+
+    # Folder containing pre-downloaded images named <meme_post_id>.jpg/png.
+    # Set to "" to fall back to downloading from image_url at runtime.
+    image_dir: str = "data/images"
+
+    # Text fields joined to form each candidate's text representation.
+    candidate_text_fields: List[str] = field(
+        default_factory=lambda: ["meme_title", "img_captions", "meme_captions", "metaphors"]
     )
-    use_image_features: bool = False
+
+    min_candidates_per_task: int = 2
+    max_candidates_per_task: int = 0   # 0 = use all (typically 10)
 
 
 @dataclass
 class TextConfig:
-    max_vocab_size: int = 50000
-    max_context_len: int = 64
-    max_candidate_len: int = 96
-    lowercase: bool = True
-    unk_token: str = "<UNK>"
-    pad_token: str = "<PAD>"
+    max_context_len: int  = 128
+    max_cand_len:    int  = 128
+    lowercase:       bool = True
 
 
 @dataclass
 class ModelConfig:
-    model_type: str = "preference"
-    text_encoder_type: str = "gru"
-    embed_dim: int = 128
-    hidden_dim: int = 128
-    dropout: float = 0.2
-    use_shared_encoder: bool = True
-    similarity_type: str = "cosine"
+    pipeline: str = "text"        # "text" | "image" | "multimodal"
+
+    # "hf"       --> HuggingFace AutoModel (text pipelines)
+    # "clip"     --> CLIP (image or multimodal)
+    # "bow_mean" --> bag-of-words baseline
+    # "gru"      --> GRU baseline
+    # "llava"    --> LLaVA VLM (multimodal only)
+    encoder_type: str = "hf"
+
+    hf_model_name:    str = "sentence-transformers/all-MiniLM-L6-v2"
+    clip_model_name:  str = "openai/clip-vit-base-patch32"
+    llava_model_name: str = "llava-hf/llava-1.5-7b-hf"
+
+    ranker_type:   str = "preference"   # "similarity" | "preference"
+    similarity_fn: str = "cosine"       # "cosine" | "dot"
+
+    shared_encoder: bool = True
+    proj_dim:       int  = 256   # 0 = skip projection
+    mlp_hidden:     int  = 512
+    dropout:        float = 0.1
+    freeze_encoder: bool  = False
+
+    # BOW / GRU specific
+    vocab_size: int = 20_000
+    embed_dim:  int = 128
+    hidden_dim: int = 256
 
 
 @dataclass
 class TrainConfig:
-    seed: int = 42
-    batch_size: int = 32
-    num_epochs: int = 10
-    lr: float = 1e-3
-    weight_decay: float = 1e-4
+    num_epochs:     int   = 10
+    batch_size:     int   = 16
+    lr:             float = 2e-5
+    weight_decay:   float = 1e-4
     grad_clip_norm: float = 1.0
-    device: str = "cuda"
-    loss_type: str = "hinge"
-    num_workers: int = 0
-    save_dir: str = "checkpoints"
-    use_amp: bool = False
+    warmup_steps:   int   = 100
+    loss_type:    str   = "bpr"   # "bpr" | "hinge"
+    hinge_margin: float = 1.0
+    device:      str  = "cuda"
+    seed:        int  = 42
+    num_workers: int  = 2
+    use_amp:     bool = True      # mixed precision, CUDA only
+    save_dir:  str = "checkpoints"
+    log_every: int = 50
 
 
 @dataclass
 class EvalConfig:
-    ndcg_k: int = 5
-    consensus_threshold: float = 0.8
-    recall_target: str = "rank1"
+    ndcg_k:        int = 10
+    recall_target: str = "rank1"   # only "rank1" for now (no avg_score column)
 
 
 @dataclass
 class Config:
-    data: DataConfig = field(default_factory=DataConfig)
-    text: TextConfig = field(default_factory=TextConfig)
+    data:  DataConfig  = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    text:  TextConfig  = field(default_factory=TextConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
-    eval: EvalConfig = field(default_factory=EvalConfig)
+    eval:  EvalConfig  = field(default_factory=EvalConfig)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
-
-def get_default_config() -> Config:
-    return Config()
+    @classmethod
+    def from_dict(cls, d: dict) -> "Config":
+        return cls(
+            data  = DataConfig(**d["data"]),
+            model = ModelConfig(**d["model"]),
+            text  = TextConfig(**d["text"]),
+            train = TrainConfig(**d["train"]),
+            eval  = EvalConfig(**d["eval"]),
+        )
 
 
 def parse_args() -> Config:
-    config = get_default_config()
-    parser = argparse.ArgumentParser(description="Train meme reply selection models.")
-
-    parser.add_argument("--train_csv", type=str, default=config.data.train_csv)
-    parser.add_argument("--val_csv", type=str, default=config.data.val_csv)
-    parser.add_argument("--test_csv", type=str, default=config.data.test_csv)
-    parser.add_argument("--min_candidates_per_task", type=int, default=config.data.min_candidates_per_task)
-    parser.add_argument(
-        "--candidate_text_fields",
-        type=str,
-        nargs="+",
-        default=list(config.data.candidate_text_fields),
+    cfg = Config()
+    parser = argparse.ArgumentParser(
+        description="Train a meme reply ranker (text / image / multimodal).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--use_image_features", action="store_true", default=config.data.use_image_features)
 
-    parser.add_argument("--max_vocab_size", type=int, default=config.text.max_vocab_size)
-    parser.add_argument("--max_context_len", type=int, default=config.text.max_context_len)
-    parser.add_argument("--max_candidate_len", type=int, default=config.text.max_candidate_len)
-    parser.add_argument("--lowercase", type=int, choices=[0, 1], default=int(config.text.lowercase))
-    parser.add_argument("--unk_token", type=str, default=config.text.unk_token)
-    parser.add_argument("--pad_token", type=str, default=config.text.pad_token)
+    parser.add_argument("--train_csv",      default=cfg.data.train_csv)
+    parser.add_argument("--val_csv",        default=cfg.data.val_csv)
+    parser.add_argument("--test_csv",       default=cfg.data.test_csv)
+    parser.add_argument("--image_dir",      default=cfg.data.image_dir,
+                   help="Folder with pre-downloaded images. "
+                        "Pass '' to download from image_url at runtime.")
+    parser.add_argument("--min_candidates", type=int, default=cfg.data.min_candidates_per_task)
+    parser.add_argument("--max_candidates", type=int, default=cfg.data.max_candidates_per_task,
+                   help="Max candidates per task (0 = all).")
 
-    parser.add_argument("--model_type", type=str, choices=["similarity", "preference"], default=config.model.model_type)
-    parser.add_argument("--text_encoder_type", type=str, choices=["bow_mean", "gru"], default=config.model.text_encoder_type)
-    parser.add_argument("--embed_dim", type=int, default=config.model.embed_dim)
-    parser.add_argument("--hidden_dim", type=int, default=config.model.hidden_dim)
-    parser.add_argument("--dropout", type=float, default=config.model.dropout)
-    parser.add_argument("--use_shared_encoder", type=int, choices=[0, 1], default=int(config.model.use_shared_encoder))
-    parser.add_argument("--similarity_type", type=str, choices=["cosine", "dot"], default=config.model.similarity_type)
+    parser.add_argument("--pipeline",      default=cfg.model.pipeline,
+                   choices=["text", "image", "multimodal"])
+    parser.add_argument("--encoder_type",  default=cfg.model.encoder_type,
+                   choices=["hf", "clip", "bow_mean", "gru", "llava"])
+    parser.add_argument("--hf_model",      default=cfg.model.hf_model_name)
+    parser.add_argument("--clip_model",    default=cfg.model.clip_model_name)
+    parser.add_argument("--llava_model",   default=cfg.model.llava_model_name)
+    parser.add_argument("--ranker_type",   default=cfg.model.ranker_type,
+                   choices=["similarity", "preference"])
+    parser.add_argument("--proj_dim",      type=int, default=cfg.model.proj_dim)
+    parser.add_argument("--freeze_encoder", action="store_true")
+    parser.add_argument("--no_shared_encoder", action="store_true",
+                   help="Use separate encoders for context and candidates.")
 
-    parser.add_argument("--seed", type=int, default=config.train.seed)
-    parser.add_argument("--batch_size", type=int, default=config.train.batch_size)
-    parser.add_argument("--num_epochs", type=int, default=config.train.num_epochs)
-    parser.add_argument("--lr", type=float, default=config.train.lr)
-    parser.add_argument("--weight_decay", type=float, default=config.train.weight_decay)
-    parser.add_argument("--grad_clip_norm", type=float, default=config.train.grad_clip_norm)
-    parser.add_argument("--device", type=str, default=config.train.device)
-    parser.add_argument("--loss_type", type=str, choices=["hinge", "bpr"], default=config.train.loss_type)
-    parser.add_argument("--num_workers", type=int, default=config.train.num_workers)
-    parser.add_argument("--save_dir", type=str, default=config.train.save_dir)
-    parser.add_argument("--use_amp", type=int, choices=[0, 1], default=int(config.train.use_amp))
+    parser.add_argument("--max_context_len", type=int, default=cfg.text.max_context_len)
+    parser.add_argument("--max_cand_len",    type=int, default=cfg.text.max_cand_len)
 
-    parser.add_argument("--ndcg_k", type=int, default=config.eval.ndcg_k)
-    parser.add_argument("--consensus_threshold", type=float, default=config.eval.consensus_threshold)
-    parser.add_argument("--recall_target", type=str, choices=["rank1", "avg_score"], default=config.eval.recall_target)
+    parser.add_argument("--num_epochs",    type=int,   default=cfg.train.num_epochs)
+    parser.add_argument("--batch_size",    type=int,   default=cfg.train.batch_size)
+    parser.add_argument("--lr",            type=float, default=cfg.train.lr)
+    parser.add_argument("--weight_decay",  type=float, default=cfg.train.weight_decay)
+    parser.add_argument("--loss_type",     default=cfg.train.loss_type,
+                   choices=["bpr", "hinge"])
+    parser.add_argument("--hinge_margin",  type=float, default=cfg.train.hinge_margin)
+    parser.add_argument("--device",        default=cfg.train.device)
+    parser.add_argument("--seed",          type=int,   default=cfg.train.seed)
+    parser.add_argument("--save_dir",      default=cfg.train.save_dir)
+    parser.add_argument("--num_workers",   type=int,   default=cfg.train.num_workers)
+    parser.add_argument("--no_amp",        action="store_true",
+                   help="Disable mixed-precision training.")
 
+    parser.add_argument("--ndcg_k", type=int, default=cfg.eval.ndcg_k)
     args = parser.parse_args()
 
-    config.data = DataConfig(
-        train_csv=args.train_csv,
-        val_csv=args.val_csv,
-        test_csv=args.test_csv,
-        min_candidates_per_task=args.min_candidates_per_task,
-        candidate_text_fields=tuple(args.candidate_text_fields),
-        use_image_features=bool(args.use_image_features),
-    )
-    config.text = TextConfig(
-        max_vocab_size=args.max_vocab_size,
-        max_context_len=args.max_context_len,
-        max_candidate_len=args.max_candidate_len,
-        lowercase=bool(args.lowercase),
-        unk_token=args.unk_token,
-        pad_token=args.pad_token,
-    )
-    config.model = ModelConfig(
-        model_type=args.model_type,
-        text_encoder_type=args.text_encoder_type,
-        embed_dim=args.embed_dim,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
-        use_shared_encoder=bool(args.use_shared_encoder),
-        similarity_type=args.similarity_type,
-    )
-    config.train = TrainConfig(
-        seed=args.seed,
-        batch_size=args.batch_size,
-        num_epochs=args.num_epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        grad_clip_norm=args.grad_clip_norm,
-        device=args.device,
-        loss_type=args.loss_type,
-        num_workers=args.num_workers,
-        save_dir=args.save_dir,
-        use_amp=bool(args.use_amp),
-    )
-    config.eval = EvalConfig(
-        ndcg_k=args.ndcg_k,
-        consensus_threshold=args.consensus_threshold,
-        recall_target=args.recall_target,
-    )
-    return config
+    cfg.data.train_csv               = args.train_csv
+    cfg.data.val_csv                 = args.val_csv
+    cfg.data.test_csv                = args.test_csv
+    cfg.data.image_dir               = args.image_dir
+    cfg.data.min_candidates_per_task = args.min_candidates
+    cfg.data.max_candidates_per_task = args.max_candidates
+
+    cfg.model.pipeline         = args.pipeline
+    cfg.model.encoder_type     = args.encoder_type
+    cfg.model.hf_model_name    = args.hf_model
+    cfg.model.clip_model_name  = args.clip_model
+    cfg.model.llava_model_name = args.llava_model
+    cfg.model.ranker_type      = args.ranker_type
+    cfg.model.proj_dim         = args.proj_dim
+    cfg.model.freeze_encoder   = args.freeze_encoder
+    cfg.model.shared_encoder   = not args.no_shared_encoder
+
+    cfg.text.max_context_len = args.max_context_len
+    cfg.text.max_cand_len    = args.max_cand_len
+
+    cfg.train.num_epochs   = args.num_epochs
+    cfg.train.batch_size   = args.batch_size
+    cfg.train.lr           = args.lr
+    cfg.train.weight_decay = args.weight_decay
+    cfg.train.loss_type    = args.loss_type
+    cfg.train.hinge_margin = args.hinge_margin
+    cfg.train.device       = args.device
+    cfg.train.seed         = args.seed
+    cfg.train.save_dir     = args.save_dir
+    cfg.train.num_workers  = args.num_workers
+    cfg.train.use_amp      = not args.no_amp
+
+    cfg.eval.ndcg_k = args.ndcg_k
+
+    return cfg

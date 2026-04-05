@@ -1,269 +1,352 @@
+"""
+Each dataset item = one task = one tweet + K candidate memes.
+
+Image handling priority (for image / multimodal pipelines):
+  1. Local file at  <image_dir>/<meme_post_id>.{jpg,jpeg,png,webp}
+  2. Download from  image_url  at runtime  (requires requests; slow)
+  3. Black 224x224 placeholder            (silent fallback)
+"""
+
 from __future__ import annotations
 
 import csv
+import io
 import os
-from dataclasses import dataclass, field
-from typing import Any
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import Dataset
+from PIL import Image
 
-from config import Config
-from text_utils import Vocab, build_candidate_text, encode_text, normalize_text
-
-
-@dataclass
-class CandidateItem:
-    candidate_id: str
-    text: str
-    rank: float
-    avg_score: float
-    metadata: dict[str, Any]
-    input_ids: list[int] = field(default_factory=list)
-    attention_mask: list[int] = field(default_factory=list)
+try:
+    import requests as _requests
+    _HAS_REQUESTS = True
+except ImportError:
+    _HAS_REQUESTS = False
 
 
 @dataclass
-class TaskItem:
-    task_id: str
-    context_text: str
-    candidate_texts: list[str]
-    ranks: list[float]
-    avg_scores: list[float]
-    candidate_ids: list[str]
-    metadata: list[dict]
-    context_input_ids: list[int] = field(default_factory=list)
-    context_attention_mask: list[int] = field(default_factory=list)
-    candidate_input_ids: list[list[int]] = field(default_factory=list)
-    candidate_attention_mask: list[list[int]] = field(default_factory=list)
+class _Candidate:
+    meme_post_id:   str
+    image_url:      str
+    candidate_text: str
+    rank:           int
+    image:          Optional[Image.Image] = None
+
+
+@dataclass
+class _Task:
+    task_id:    str
+    tweet_text: str
+    candidates: List[_Candidate]
 
 
 @dataclass
 class Batch:
-    context_input_ids: torch.Tensor
-    context_attention_mask: torch.Tensor
-    candidate_input_ids: torch.Tensor
-    candidate_attention_mask: torch.Tensor
-    candidate_mask: torch.Tensor
-    ranks: torch.Tensor
-    avg_scores: torch.Tensor
-    task_ids: list[str]
-    candidate_ids: list[list[str]]
-    metadata: list[list[dict]]
+    """
+    All tensors that a model forward pass may need.
+
+    context_input_ids      : [B, Lc]         tweet token ids
+    context_attention_mask : [B, Lc]
+    candidate_input_ids    : [B, K, Lm]      candidate text token ids   (None = image-only)
+    candidate_attention_mask: [B, K, Lm]                                (None = image-only)
+    pixel_values           : [B, K, C, H, W] candidate images           (None = text-only)
+    candidate_mask         : [B, K]          1 = real candidate, 0 = pad slot
+    ranks                  : [B, K]          int  1 = best, higher = worse
+    task_ids               : List[str]       length B
+    """
+    context_input_ids:       Optional[torch.Tensor]
+    context_attention_mask:  Optional[torch.Tensor]
+    candidate_input_ids:     Optional[torch.Tensor]
+    candidate_attention_mask: Optional[torch.Tensor]
+    pixel_values:            Optional[torch.Tensor]
+    candidate_mask:          torch.Tensor    # [B, K]  real=1, pad=0
+    ranks:                   torch.Tensor    # [B, K]
+    task_ids:                List[str]
+
+def _find_local_image(image_dir: str, meme_post_id: str) -> Optional[str]:
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        p = os.path.join(image_dir, meme_post_id + ext)
+        if os.path.exists(p):
+            return p
+    return None
 
 
-def load_csv_rows(csv_path: str) -> list[dict]:
-    resolved_path = resolve_csv_path(csv_path)
-    with open(resolved_path, "r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        return [dict(row) for row in reader]
+def _download_image(url: str, retries: int = 2) -> Optional[Image.Image]:
+    if not (_HAS_REQUESTS and url):
+        return None
+    for attempt in range(retries):
+        try:
+            r = _requests.get(url, timeout=10)
+            r.raise_for_status()
+            return Image.open(io.BytesIO(r.content)).convert("RGB")
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(1)
+    return None
 
 
-def resolve_csv_path(csv_path: str) -> str:
-    if os.path.exists(csv_path):
-        return csv_path
+def _load_image(meme_post_id: str, image_url: str, image_dir: str) -> Image.Image:
+    """
+    Try local --> download --> black placeholder.
+    """
+    if image_dir:
+        local = _find_local_image(image_dir, meme_post_id)
+        if local:
+            try:
+                return Image.open(local).convert("RGB")
+            except Exception:
+                pass
 
-    candidates: list[str] = []
-    normalized_path = csv_path.replace("\\", "/")
-    if "/clean/" in normalized_path:
-        candidates.append(normalized_path.replace("/clean/", "/", 1))
-    else:
-        directory, filename = os.path.split(normalized_path)
-        candidates.append(os.path.join(directory, "clean", filename) if directory else os.path.join("data", "clean", filename))
+    img = _download_image(image_url)
+    if img is not None:
+        return img
 
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-
-    raise FileNotFoundError(f"Could not find CSV file at '{csv_path}' or fallback locations: {candidates}")
-
-
-def _to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+    return Image.new("RGB", (224, 224), color=(0, 0, 0))
 
 
-def group_rows_by_task(rows: list[dict], min_candidates: int = 2) -> list[TaskItem]:
-    grouped: dict[str, list[dict]] = {}
-    for row in rows:
-        task_id = str(row.get("task_id", "") or "").strip()
-        if not task_id:
-            continue
-        grouped.setdefault(task_id, []).append(row)
+def _load_tasks(csv_path: str, candidate_text_fields: List[str]) -> List[_Task]:
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-    tasks: list[TaskItem] = []
-    for task_id, task_rows in grouped.items():
-        if len(task_rows) < min_candidates:
-            continue
-
-        task_rows = sorted(
-            task_rows,
-            key=lambda row: (
-                _to_float(row.get("rank"), float("inf")),
-                _to_float(row.get("candidate_index"), float("inf")),
-            ),
-        )
-        context_text = normalize_text(str(task_rows[0].get("tweet_text", "") or ""))
-
-        candidate_texts: list[str] = []
-        ranks: list[float] = []
-        avg_scores: list[float] = []
-        candidate_ids: list[str] = []
-        metadata: list[dict] = []
-
-        for row in task_rows:
-            candidate_texts.append("")
-            ranks.append(_to_float(row.get("rank"), default=9999.0))
-            avg_scores.append(_to_float(row.get("avg_score"), default=0.0))
-            candidate_ids.append(str(row.get("meme_post_id", "") or ""))
-            metadata.append(dict(row))
-
-        tasks.append(
-            TaskItem(
-                task_id=task_id,
-                context_text=context_text,
-                candidate_texts=candidate_texts,
-                ranks=ranks,
-                avg_scores=avg_scores,
-                candidate_ids=candidate_ids,
-                metadata=metadata,
-            )
-        )
-    return tasks
-
-
-def build_vocab_from_tasks(tasks: list[TaskItem], text_config) -> Vocab:
-    vocab = Vocab(pad_token=text_config.pad_token, unk_token=text_config.unk_token)
-    texts: list[str] = []
-    for task in tasks:
-        texts.append(task.context_text)
-        texts.extend(task.candidate_texts)
-    vocab.fit(texts, max_size=text_config.max_vocab_size)
-    return vocab
-
-
-class MemeRankingDataset(Dataset):
-    def __init__(self, tasks: list[TaskItem], vocab: Vocab, text_config) -> None:
-        self.tasks = tasks
-        self.vocab = vocab
-        self.text_config = text_config
-        self._prepare()
-
-    def _prepare(self) -> None:
-        for task in self.tasks:
-            context_ids, context_mask = encode_text(
-                normalize_text(task.context_text, lowercase=self.text_config.lowercase),
-                self.vocab,
-                self.text_config.max_context_len,
-            )
-            task.context_input_ids = context_ids
-            task.context_attention_mask = context_mask
-            task.candidate_input_ids = []
-            task.candidate_attention_mask = []
-
-            for idx, candidate_text in enumerate(task.candidate_texts):
-                text = normalize_text(candidate_text, lowercase=self.text_config.lowercase)
-                input_ids, attention_mask = encode_text(
-                    text,
-                    self.vocab,
-                    self.text_config.max_candidate_len,
+    grouped: Dict[str, _Task] = {}
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            tid = row["task_id"]
+            if tid not in grouped:
+                grouped[tid] = _Task(
+                    task_id    = tid,
+                    tweet_text = row["tweet_text"],
+                    candidates = [],
                 )
-                task.candidate_input_ids.append(input_ids)
-                task.candidate_attention_mask.append(attention_mask)
-                task.candidate_texts[idx] = text
+            parts = [row.get(fld, "").strip() for fld in candidate_text_fields]
+            cand_text = " | ".join(p for p in parts if p)
+            grouped[tid].candidates.append(
+                _Candidate(
+                    meme_post_id   = row["meme_post_id"],
+                    image_url      = row.get("image_url", ""),
+                    candidate_text = cand_text,
+                    rank           = int(row["rank"]),
+                )
+            )
+
+    for task in grouped.values():
+        task.candidates.sort(key=lambda c: c.rank)
+    return list(grouped.values())
+
+
+class MemeDataset(Dataset):
+    def __init__(
+        self,
+        tasks:          List[_Task],
+        pipeline:       str,
+        image_dir:      str  = "",
+        min_candidates: int  = 2,
+        max_candidates: int  = 0,
+    ):
+        self.pipeline  = pipeline
+        self.image_dir = image_dir
+        need_images    = pipeline in ("image", "multimodal")
+        filtered       = []
+
+        for task in tasks:
+            cands = task.candidates
+            if max_candidates > 0:
+                cands = cands[:max_candidates]
+            if len(cands) < min_candidates:
+                continue
+            if need_images:
+                for c in cands:
+                    c.image = _load_image(c.meme_post_id, c.image_url, image_dir)
+            filtered.append(_Task(task.task_id, task.tweet_text, cands))
+
+        self.tasks = filtered
+        print(f"[Dataset] {len(self.tasks)} tasks  pipeline={pipeline}")
 
     def __len__(self) -> int:
         return len(self.tasks)
 
-    def __getitem__(self, index: int) -> TaskItem:
-        return self.tasks[index]
+    def __getitem__(self, idx: int) -> _Task:
+        return self.tasks[idx]
 
 
-def collate_fn(batch: list[TaskItem]) -> Batch:
-    batch_size = len(batch)
-    max_candidates = max(len(task.candidate_input_ids) for task in batch)
-    max_context_len = max(max(len(task.context_input_ids), 1) for task in batch)
-    max_candidate_len = max(
-        max(max((len(ids) for ids in task.candidate_input_ids), default=0), 1) for task in batch
+def make_collate_fn(
+    pipeline:        str,
+    tokenizer=None,         # HF AutoTokenizer or CLIPProcessor
+    image_processor=None,   # HF CLIPImageProcessor (when not using full CLIPProcessor)
+    vocab=None,             # Vocab instance (BOW / GRU path)
+    text_cfg=None,          # TextConfig
+):
+    need_text  = pipeline in ("text", "multimodal")
+    need_image = pipeline in ("image", "multimodal")
+    max_ctx    = text_cfg.max_context_len if text_cfg else 128
+    max_cand   = text_cfg.max_cand_len    if text_cfg else 128
+
+    def collate_fn(tasks: List[_Task]) -> Batch:
+        B = len(tasks)
+        K = max(len(t.candidates) for t in tasks)
+
+        ctx_texts    = [t.tweet_text for t in tasks]
+        cand_texts   = []   # length B*K (padded slots get "")
+        images       = []   # length B*K
+        ranks        = torch.full((B, K), fill_value=K + 1, dtype=torch.long)
+        cand_mask    = torch.zeros(B, K, dtype=torch.long)
+
+        for b, task in enumerate(tasks):
+            for k, cand in enumerate(task.candidates):
+                cand_texts.append(cand.candidate_text)
+                if need_image:
+                    images.append(
+                        cand.image if cand.image is not None
+                        else Image.new("RGB", (224, 224))
+                    )
+                ranks[b, k]     = cand.rank
+                cand_mask[b, k] = 1
+            for k in range(len(task.candidates), K):
+                cand_texts.append("")
+                if need_image:
+                    images.append(Image.new("RGB", (224, 224)))
+
+        ctx_ids = ctx_mask = cand_ids = cand_attn = None
+
+        if need_text and tokenizer is not None:
+            # HuggingFace tokenizer (AutoTokenizer or CLIPProcessor)
+            ctx_enc = tokenizer(
+                ctx_texts,
+                padding=True, truncation=True, max_length=max_ctx,
+                return_tensors="pt",
+            )
+            cand_enc = tokenizer(
+                cand_texts,
+                padding=True, truncation=True, max_length=max_cand,
+                return_tensors="pt",
+            )
+            ctx_ids  = ctx_enc["input_ids"]                         # [B, Lc]
+            ctx_mask = ctx_enc["attention_mask"]
+            cand_ids  = cand_enc["input_ids"].view(B, K, -1)        # [B, K, Lm]
+            cand_attn = cand_enc["attention_mask"].view(B, K, -1)
+
+        elif need_text and vocab is not None:
+            # BOW / GRU path
+            ctx_ids,  ctx_mask  = vocab.encode_batch(ctx_texts,  max_ctx)
+            flat_ids, flat_mask = vocab.encode_batch(cand_texts, max_cand)
+            cand_ids  = flat_ids.view(B, K, -1)
+            cand_attn = flat_mask.view(B, K, -1)
+
+        pixel_values = None
+        if need_image and images:
+            proc = image_processor if image_processor is not None else tokenizer
+            if proc is not None:
+                out = proc(images=images, return_tensors="pt")
+                pv  = out["pixel_values"]                   # [B*K, C, H, W]
+                pixel_values = pv.view(B, K, *pv.shape[1:])
+
+        return Batch(
+            context_input_ids        = ctx_ids,
+            context_attention_mask   = ctx_mask,
+            candidate_input_ids      = cand_ids,
+            candidate_attention_mask = cand_attn,
+            pixel_values             = pixel_values,
+            candidate_mask           = cand_mask,
+            ranks                    = ranks,
+            task_ids                 = [t.task_id for t in tasks],
+        )
+
+    return collate_fn
+
+collate_fn = None
+
+
+def load_datasets(config):
+    from text_utils import Vocab, build_vocab
+
+    cfg      = config
+    pipeline = cfg.model.pipeline
+    enc_type = cfg.model.encoder_type
+
+    def _tasks(path):
+        return _load_tasks(path, cfg.data.candidate_text_fields)
+
+    train_tasks = _tasks(cfg.data.train_csv)
+    val_tasks   = _tasks(cfg.data.val_csv)
+    test_tasks  = _tasks(cfg.data.test_csv)
+
+    if enc_type in ("bow_mean", "gru"):
+        all_texts = []
+        for task in train_tasks:
+            all_texts.append(task.tweet_text)
+            for c in task.candidates:
+                all_texts.append(c.candidate_text)
+        vocab = build_vocab(all_texts, max_size=cfg.model.vocab_size)
+    else:
+        vocab = Vocab(max_size=2)
+
+    tokenizer, image_processor = _build_processors(cfg)
+
+    global collate_fn
+    collate_fn = make_collate_fn(
+        pipeline        = pipeline,
+        tokenizer       = tokenizer,
+        image_processor = image_processor,
+        vocab           = vocab,
+        text_cfg        = cfg.text,
     )
 
-    context_input_ids = torch.zeros(batch_size, max_context_len, dtype=torch.long)
-    context_attention_mask = torch.zeros(batch_size, max_context_len, dtype=torch.long)
-    candidate_input_ids = torch.zeros(batch_size, max_candidates, max_candidate_len, dtype=torch.long)
-    candidate_attention_mask = torch.zeros(batch_size, max_candidates, max_candidate_len, dtype=torch.long)
-    candidate_mask = torch.zeros(batch_size, max_candidates, dtype=torch.float32)
-    ranks = torch.full((batch_size, max_candidates), fill_value=9999.0, dtype=torch.float32)
-    avg_scores = torch.zeros(batch_size, max_candidates, dtype=torch.float32)
-    task_ids: list[str] = []
-    candidate_ids: list[list[str]] = []
-    metadata: list[list[dict]] = []
+    def _ds(tasks):
+        return MemeDataset(
+            tasks          = tasks,
+            pipeline       = pipeline,
+            image_dir      = cfg.data.image_dir,
+            min_candidates = cfg.data.min_candidates_per_task,
+            max_candidates = cfg.data.max_candidates_per_task,
+        )
 
-    for batch_idx, task in enumerate(batch):
-        context_len = len(task.context_input_ids)
-        if context_len > 0:
-            context_input_ids[batch_idx, :context_len] = torch.tensor(task.context_input_ids, dtype=torch.long)
-            context_attention_mask[batch_idx, :context_len] = torch.tensor(task.context_attention_mask, dtype=torch.long)
-
-        task_ids.append(task.task_id)
-        candidate_ids.append(task.candidate_ids)
-        metadata.append(task.metadata)
-
-        for cand_idx, candidate_ids_list in enumerate(task.candidate_input_ids):
-            cand_len = len(candidate_ids_list)
-            if cand_len > 0:
-                candidate_input_ids[batch_idx, cand_idx, :cand_len] = torch.tensor(candidate_ids_list, dtype=torch.long)
-                candidate_attention_mask[batch_idx, cand_idx, :cand_len] = torch.tensor(
-                    task.candidate_attention_mask[cand_idx],
-                    dtype=torch.long,
-                )
-            candidate_mask[batch_idx, cand_idx] = 1.0
-            ranks[batch_idx, cand_idx] = float(task.ranks[cand_idx])
-            avg_scores[batch_idx, cand_idx] = float(task.avg_scores[cand_idx])
-
-    return Batch(
-        context_input_ids=context_input_ids,
-        context_attention_mask=context_attention_mask,
-        candidate_input_ids=candidate_input_ids,
-        candidate_attention_mask=candidate_attention_mask,
-        candidate_mask=candidate_mask,
-        ranks=ranks,
-        avg_scores=avg_scores,
-        task_ids=task_ids,
-        candidate_ids=candidate_ids,
-        metadata=metadata,
-    )
+    return _ds(train_tasks), _ds(val_tasks), _ds(test_tasks), vocab
 
 
-def load_datasets(config: Config) -> tuple[MemeRankingDataset, MemeRankingDataset, MemeRankingDataset, Vocab]:
-    train_rows = load_csv_rows(config.data.train_csv)
-    val_rows = load_csv_rows(config.data.val_csv)
-    test_rows = load_csv_rows(config.data.test_csv)
+def _build_processors(cfg):
+    """
+    Returns (tokenizer, image_processor).
 
-    train_tasks = group_rows_by_task(train_rows, min_candidates=config.data.min_candidates_per_task)
-    val_tasks = group_rows_by_task(val_rows, min_candidates=config.data.min_candidates_per_task)
-    test_tasks = group_rows_by_task(test_rows, min_candidates=config.data.min_candidates_per_task)
+    encoder_type | pipeline  | tokenizer               | image_processor
+    ─────────────────────────────────────────────────────────────────────
+    hf           | text       | AutoTokenizer           | None
+    hf           | multimodal | AutoTokenizer           | CLIPImageProcessor
+    clip         | *          | CLIPProcessor           | CLIPProcessor
+    bow_mean/gru | *          | None (use Vocab)        | CLIPImageProcessor?
+    llava        | multimodal | LlavaProcessor          | LlavaProcessor
+    """
+    enc  = cfg.model.encoder_type
+    pipe = cfg.model.pipeline
 
-    for task in train_tasks:
-        task.candidate_texts = [
-            normalize_text(build_candidate_text(meta, config.data.candidate_text_fields), lowercase=config.text.lowercase)
-            for meta in task.metadata
-        ]
-    for task in val_tasks:
-        task.candidate_texts = [
-            normalize_text(build_candidate_text(meta, config.data.candidate_text_fields), lowercase=config.text.lowercase)
-            for meta in task.metadata
-        ]
-    for task in test_tasks:
-        task.candidate_texts = [
-            normalize_text(build_candidate_text(meta, config.data.candidate_text_fields), lowercase=config.text.lowercase)
-            for meta in task.metadata
-        ]
+    tokenizer       = None
+    image_processor = None
 
-    vocab = build_vocab_from_tasks(train_tasks, config.text)
+    if enc == "hf":
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(cfg.model.hf_model_name)
+        if pipe in ("image", "multimodal"):
+            from transformers import CLIPImageProcessor
+            image_processor = CLIPImageProcessor.from_pretrained(cfg.model.clip_model_name)
 
-    train_dataset = MemeRankingDataset(train_tasks, vocab, config.text)
-    val_dataset = MemeRankingDataset(val_tasks, vocab, config.text)
-    test_dataset = MemeRankingDataset(test_tasks, vocab, config.text)
-    return train_dataset, val_dataset, test_dataset, vocab
+    elif enc == "clip":
+        from transformers import CLIPProcessor
+        proc = CLIPProcessor.from_pretrained(cfg.model.clip_model_name)
+        tokenizer       = proc
+        image_processor = proc
+
+    elif enc == "llava":
+        from transformers import AutoProcessor
+        proc = AutoProcessor.from_pretrained(cfg.model.llava_model_name)
+        tokenizer       = proc
+        image_processor = proc
+
+    elif enc in ("bow_mean", "gru"):
+        # vocab handles text; still need image processor for image pipelines
+        if pipe in ("image", "multimodal"):
+            from transformers import CLIPImageProcessor
+            image_processor = CLIPImageProcessor.from_pretrained(cfg.model.clip_model_name)
+
+    return tokenizer, image_processor

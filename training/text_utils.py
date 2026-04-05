@@ -2,109 +2,84 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from typing import List, Tuple
+
+import torch
+
+PAD_TOKEN = "<PAD>"
+UNK_TOKEN = "<UNK>"
+PAD_IDX   = 0
+UNK_IDX   = 1
 
 
-def normalize_text(text: str, lowercase: bool = True) -> str:
-    if text is None:
-        text = ""
-    text = str(text)
-    text = re.sub(r"\s+", " ", text).strip()
+def _tokenize(text: str, lowercase: bool = True) -> List[str]:
     if lowercase:
         text = text.lower()
-    return text
-
-
-def safe_join_text(parts: list[str]) -> str:
-    cleaned = []
-    for part in parts:
-        if part is None:
-            continue
-        value = str(part).strip()
-        if not value or value.lower() == "nan":
-            continue
-        cleaned.append(value)
-    return " [SEP] ".join(cleaned)
-
-
-def build_candidate_text(row: dict, text_fields: tuple[str, ...]) -> str:
-    return safe_join_text([str(row.get(field, "") or "") for field in text_fields])
-
-
-def tokenize(text: str) -> list[str]:
-    text = text.strip()
-    if not text:
-        return []
+    text = re.sub(r"[^a-z0-9'\-|]", " ", text)
     return text.split()
 
 
 class Vocab:
-    def __init__(self, pad_token: str = "<PAD>", unk_token: str = "<UNK>") -> None:
-        self.pad_token = pad_token
-        self.unk_token = unk_token
-        self.stoi: dict[str, int] = {}
-        self.itos: list[str] = []
-        self._add_special(self.pad_token)
-        self._add_special(self.unk_token)
+    def __init__(self, max_size: int = 20_000, lowercase: bool = True):
+        self.max_size  = max_size
+        self.lowercase = lowercase
+        self._token2id: dict = {PAD_TOKEN: PAD_IDX, UNK_TOKEN: UNK_IDX}
+        self._id2token: list = [PAD_TOKEN, UNK_TOKEN]
 
-    def _add_special(self, token: str) -> None:
-        if token not in self.stoi:
-            self.stoi[token] = len(self.itos)
-            self.itos.append(token)
-
-    @property
-    def pad_id(self) -> int:
-        return self.stoi[self.pad_token]
-
-    @property
-    def unk_id(self) -> int:
-        return self.stoi[self.unk_token]
-
-    def fit(self, texts: list[str], max_size: int | None = None) -> None:
-        counter: Counter[str] = Counter()
+    def fit(self, texts: List[str]) -> "Vocab":
+        counter: Counter = Counter()
         for text in texts:
-            counter.update(tokenize(text))
+            counter.update(_tokenize(text, self.lowercase))
+        for token, _ in counter.most_common(self.max_size - 2):
+            if token not in self._token2id:
+                idx = len(self._id2token)
+                self._token2id[token] = idx
+                self._id2token.append(token)
+        return self
 
-        max_tokens = None if max_size is None else max(max_size - len(self.itos), 0)
-        for token, _ in counter.most_common(max_tokens):
-            if token not in self.stoi:
-                self.stoi[token] = len(self.itos)
-                self.itos.append(token)
+    def encode(self, text: str, max_len: int) -> Tuple[List[int], List[int]]:
+        tokens  = _tokenize(text, self.lowercase)[:max_len]
+        ids     = [self._token2id.get(t, UNK_IDX) for t in tokens]
+        mask    = [1] * len(ids)
+        pad_len = max_len - len(ids)
+        ids  += [PAD_IDX] * pad_len
+        mask += [0]       * pad_len
+        return ids, mask
 
-    def encode(self, tokens: list[str]) -> list[int]:
-        return [self.stoi.get(token, self.unk_id) for token in tokens]
-
-    def decode(self, ids: list[int]) -> list[str]:
-        decoded = []
-        for idx in ids:
-            if 0 <= idx < len(self.itos):
-                decoded.append(self.itos[idx])
-            else:
-                decoded.append(self.unk_token)
-        return decoded
-
-    def __len__(self) -> int:
-        return len(self.itos)
+    def encode_batch(
+        self, texts: List[str], max_len: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        all_ids, all_mask = [], []
+        for text in texts:
+            ids, mask = self.encode(text, max_len)
+            all_ids.append(ids)
+            all_mask.append(mask)
+        return (
+            torch.tensor(all_ids,  dtype=torch.long),
+            torch.tensor(all_mask, dtype=torch.long),
+        )
 
     def state_dict(self) -> dict:
         return {
-            "pad_token": self.pad_token,
-            "unk_token": self.unk_token,
-            "itos": self.itos,
+            "token2id":  self._token2id,
+            "id2token":  self._id2token,
+            "max_size":  self.max_size,
+            "lowercase": self.lowercase,
         }
 
     @classmethod
-    def from_state_dict(cls, state: dict) -> "Vocab":
-        vocab = cls(
-            pad_token=state["pad_token"],
-            unk_token=state["unk_token"],
-        )
-        vocab.itos = list(state["itos"])
-        vocab.stoi = {token: idx for idx, token in enumerate(vocab.itos)}
-        return vocab
+    def from_state_dict(cls, d: dict) -> "Vocab":
+        v = cls(max_size=d["max_size"], lowercase=d["lowercase"])
+        v._token2id = d["token2id"]
+        v._id2token = d["id2token"]
+        return v
+
+    def __len__(self) -> int:
+        return len(self._id2token)
 
 
-def encode_text(text: str, vocab: Vocab, max_len: int) -> tuple[list[int], list[int]]:
-    tokens = tokenize(text)[:max_len]
-    token_ids = vocab.encode(tokens)
-    attention_mask = [1] * len(token_ids)
-    return token_ids, attention_mask
+def build_vocab(texts: List[str], max_size: int = 20_000) -> Vocab:
+    v = Vocab(max_size=max_size)
+    v.fit(texts)
+    print(f"[Vocab] {len(v)} tokens from {len(texts)} strings.")
+    return v
