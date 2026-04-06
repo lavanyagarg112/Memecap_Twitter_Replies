@@ -1,154 +1,386 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import Config
 from dataset import Batch
 
 
-class TextEncoder(nn.Module):
-    def __init__(self, vocab_size: int, pad_idx: int, text_encoder_type: str, embed_dim: int, hidden_dim: int, dropout: float) -> None:
+class _Proj(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.1):
         super().__init__()
-        self.text_encoder_type = text_encoder_type
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
-        self.dropout = nn.Dropout(dropout)
-        if text_encoder_type == "gru":
-            self.gru = nn.GRU(
-                input_size=embed_dim,
-                hidden_size=hidden_dim,
-                batch_first=True,
-            )
-            self.output_dim = hidden_dim
-        elif text_encoder_type == "bow_mean":
-            self.output_dim = embed_dim
-        else:
-            raise ValueError(f"Unsupported text_encoder_type: {text_encoder_type}")
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(out_dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class _HFTextEncoder(nn.Module):
+    def __init__(self, model_name: str, freeze: bool = False):
+        super().__init__()
+        from transformers import AutoModel
+        self.model   = AutoModel.from_pretrained(model_name)
+        self.out_dim = self.model.config.hidden_size
+        if freeze:
+            for p in self.model.parameters():
+                p.requires_grad_(False)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        embeddings = self.dropout(self.embedding(input_ids))
-        attention_mask = attention_mask.float()
-
-        if self.text_encoder_type == "bow_mean":
-            masked_embeddings = embeddings * attention_mask.unsqueeze(-1)
-            lengths = attention_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-            return masked_embeddings.sum(dim=1) / lengths
-
-        lengths = attention_mask.sum(dim=1).long().clamp_min(1)
-        packed = nn.utils.rnn.pack_padded_sequence(
-            embeddings,
-            lengths.cpu(),
-            batch_first=True,
-            enforce_sorted=False,
-        )
-        _, hidden = self.gru(packed)
-        return hidden[-1]
+        out  = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        mask = attention_mask.unsqueeze(-1).float()
+        return (out.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
 
 
-class SimilarityRanker(nn.Module):
-    def __init__(self, config: Config, vocab_size: int, pad_idx: int) -> None:
+class _CLIPTextEncoder(nn.Module):
+    def __init__(self, model_name: str, freeze: bool = False):
         super().__init__()
-        self.config = config
-        self.context_encoder = TextEncoder(
-            vocab_size=vocab_size,
-            pad_idx=pad_idx,
-            text_encoder_type=config.model.text_encoder_type,
-            embed_dim=config.model.embed_dim,
-            hidden_dim=config.model.hidden_dim,
-            dropout=config.model.dropout,
+        from transformers import CLIPModel
+        self.clip    = CLIPModel.from_pretrained(model_name)
+        self.out_dim = self.clip.config.text_config.hidden_size
+        if freeze:
+            for p in self.clip.text_model.parameters():
+                p.requires_grad_(False)
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        return self.clip.get_text_features(input_ids=input_ids, attention_mask=attention_mask)
+
+
+class _BOWEncoder(nn.Module):
+    def __init__(self, vocab_size: int, embed_dim: int, pad_idx: int = 0):
+        super().__init__()
+        self.embed   = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
+        self.out_dim = embed_dim
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        emb  = self.embed(input_ids)
+        mask = attention_mask.unsqueeze(-1).float()
+        return (emb * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+
+
+class _GRUEncoder(nn.Module):
+    def __init__(self, vocab_size: int, embed_dim: int, hidden_dim: int, pad_idx: int = 0):
+        super().__init__()
+        self.embed   = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
+        self.gru     = nn.GRU(embed_dim, hidden_dim, batch_first=True, bidirectional=True)
+        self.out_dim = hidden_dim * 2
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        emb     = self.embed(input_ids)
+        lengths = attention_mask.sum(1).clamp(min=1).cpu()
+        packed  = nn.utils.rnn.pack_padded_sequence(
+            emb, lengths, batch_first=True, enforce_sorted=False
         )
-        if config.model.use_shared_encoder:
-            self.candidate_encoder = self.context_encoder
-        else:
-            self.candidate_encoder = TextEncoder(
-                vocab_size=vocab_size,
-                pad_idx=pad_idx,
-                text_encoder_type=config.model.text_encoder_type,
-                embed_dim=config.model.embed_dim,
-                hidden_dim=config.model.hidden_dim,
-                dropout=config.model.dropout,
+        _, h = self.gru(packed)   # h: [2, N, H]
+        return torch.cat([h[0], h[1]], dim=-1)
+
+
+class _CLIPImageEncoder(nn.Module):
+    def __init__(self, model_name: str, freeze: bool = False):
+        super().__init__()
+        from transformers import CLIPModel
+        self.clip    = CLIPModel.from_pretrained(model_name)
+        self.out_dim = self.clip.config.vision_config.hidden_size
+        if freeze:
+            for p in self.clip.vision_model.parameters():
+                p.requires_grad_(False)
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self.clip.get_image_features(pixel_values=pixel_values)
+
+
+class _LLaVAEncoder(nn.Module):
+    def __init__(self, model_name: str, freeze: bool = False):
+        super().__init__()
+        from transformers import LlavaForConditionalGeneration
+        self.model   = LlavaForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype = torch.float16,
+            low_cpu_mem_usage = True,
+        )
+        self.out_dim = self.model.config.text_config.hidden_size
+        if freeze:
+            for p in self.model.parameters():
+                p.requires_grad_(False)
+
+    def forward(
+        self,
+        input_ids:      torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_values:   torch.Tensor,
+    ) -> torch.Tensor:
+        out = self.model(
+            input_ids      = input_ids,
+            attention_mask = attention_mask,
+            pixel_values   = pixel_values,
+            output_hidden_states = True,
+        )
+        last_hidden = out.hidden_states[-1]    # [N, L, D]
+        seq_lens = attention_mask.sum(1) - 1   # [N]
+        idx      = seq_lens.clamp(min=0).unsqueeze(-1).unsqueeze(-1).expand(
+            -1, 1, last_hidden.size(-1)
+        )
+        emb = last_hidden.gather(1, idx).squeeze(1)   # [N, D]
+        return emb.float()
+
+
+class _QwenVLPairEncoder(nn.Module):
+    def __init__(self, model_name: str, freeze: bool = False):
+        super().__init__()
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype="auto",
+        )
+        self.out_dim = self.model.config.text_config.hidden_size
+        if freeze:
+            for p in self.model.parameters():
+                p.requires_grad_(False)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        out = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        last_hidden = out.hidden_states[-1]
+        seq_lens = attention_mask.sum(1) - 1
+        idx = seq_lens.clamp(min=0).unsqueeze(-1).unsqueeze(-1).expand(
+            -1, 1, last_hidden.size(-1)
+        )
+        emb = last_hidden.gather(1, idx).squeeze(1)
+        return emb.float()
+
+
+class _SimilarityRanker(nn.Module):
+    def __init__(self, ctx_dim: int, cand_dim: int, proj_dim: int,
+                 sim_fn: str = "cosine", dropout: float = 0.1):
+        super().__init__()
+        self.ctx_proj  = _Proj(ctx_dim,  proj_dim, dropout)
+        self.cand_proj = _Proj(cand_dim, proj_dim, dropout)
+        self.sim_fn    = sim_fn
+
+    def forward(self, ctx: torch.Tensor, cand: torch.Tensor) -> torch.Tensor:
+        """ctx [B,D], cand [B,K,D] → scores [B,K]"""
+        c = self.ctx_proj(ctx).unsqueeze(1).expand_as(
+            self.cand_proj(cand)
+        )
+        m = self.cand_proj(cand)
+        if self.sim_fn == "cosine":
+            return F.cosine_similarity(c, m, dim=-1)
+        return (c * m).sum(-1)
+
+
+class _PreferenceRanker(nn.Module):
+    def __init__(self, ctx_dim: int, cand_dim: int, proj_dim: int,
+                 mlp_hidden: int = 512, dropout: float = 0.1):
+        super().__init__()
+        self.ctx_proj  = _Proj(ctx_dim,  proj_dim, dropout)
+        self.cand_proj = _Proj(cand_dim, proj_dim, dropout)
+        self.mlp = nn.Sequential(
+            nn.Linear(proj_dim * 4, mlp_hidden),
+            nn.LayerNorm(mlp_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, mlp_hidden // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden // 2, 1),
+        )
+
+    def forward(self, ctx: torch.Tensor, cand: torch.Tensor) -> torch.Tensor:
+        """ctx [B,D], cand [B,K,D] → scores [B,K]"""
+        c = self.ctx_proj(ctx).unsqueeze(1).expand(
+            ctx.shape[0], cand.shape[1], -1
+        )
+        m = self.cand_proj(cand)
+        f = torch.cat([c, m, (c - m).abs(), c * m], dim=-1)
+        return self.mlp(f).squeeze(-1)
+
+
+class MemeRanker(nn.Module):
+    def __init__(self, cfg, vocab_size: int = 2):
+        super().__init__()
+        mcfg     = cfg.model
+        pipeline = mcfg.pipeline
+        enc_type = mcfg.encoder_type
+        freeze   = mcfg.freeze_encoder
+
+        self.pipeline  = pipeline
+        self.enc_type  = enc_type
+        self.is_qwen_vl = enc_type == "qwen_vl" and pipeline in ("image", "multimodal")
+        self.is_llava  = (enc_type == "llava")
+
+        if enc_type == "qwen_vl" and pipeline not in ("image", "multimodal"):
+            raise ValueError(
+                "encoder_type='qwen_vl' currently only supports pipeline='image' or 'multimodal'."
             )
 
-    def forward(self, batch: Batch) -> torch.Tensor:
-        batch_size, num_candidates, candidate_len = batch.candidate_input_ids.shape
-        context_embeddings = self.context_encoder(batch.context_input_ids, batch.context_attention_mask)
-        flat_candidate_ids = batch.candidate_input_ids.view(batch_size * num_candidates, candidate_len)
-        flat_candidate_mask = batch.candidate_attention_mask.view(batch_size * num_candidates, candidate_len)
-        candidate_embeddings = self.candidate_encoder(flat_candidate_ids, flat_candidate_mask)
-        candidate_embeddings = candidate_embeddings.view(batch_size, num_candidates, -1)
+        if self.is_qwen_vl:
+            if mcfg.ranker_type != "preference":
+                raise ValueError(
+                    "encoder_type='qwen_vl' only supports ranker_type='preference'."
+                )
+            self.ctx_enc = None
+            self.qwen_pair_enc = _QwenVLPairEncoder(mcfg.qwen_vl_model_name, freeze=freeze)
+            score_dim = mcfg.proj_dim if mcfg.proj_dim > 0 else self.qwen_pair_enc.out_dim
+            if score_dim == self.qwen_pair_enc.out_dim:
+                self.pair_proj = nn.Identity()
+            else:
+                self.pair_proj = _Proj(self.qwen_pair_enc.out_dim, score_dim, mcfg.dropout)
+            self.pair_scorer = nn.Sequential(
+                nn.Linear(score_dim, mcfg.mlp_hidden),
+                nn.LayerNorm(mcfg.mlp_hidden),
+                nn.GELU(),
+                nn.Dropout(mcfg.dropout),
+                nn.Linear(mcfg.mlp_hidden, 1),
+            )
+            self.cand_text_enc = None
+            self.cand_img_enc  = None
+            self.ranker = None
+            return
 
-        if self.config.model.similarity_type == "cosine":
-            context_embeddings = F.normalize(context_embeddings, dim=-1)
-            candidate_embeddings = F.normalize(candidate_embeddings, dim=-1)
-            scores = (candidate_embeddings * context_embeddings.unsqueeze(1)).sum(dim=-1)
-        elif self.config.model.similarity_type == "dot":
-            scores = (candidate_embeddings * context_embeddings.unsqueeze(1)).sum(dim=-1)
+        self.ctx_enc = self._make_text_enc(mcfg, vocab_size, freeze)
+
+        if enc_type == "llava":
+            self.llava_enc = _LLaVAEncoder(mcfg.llava_model_name, freeze=freeze)
+            cand_dim = self.llava_enc.out_dim
+            self.cand_text_enc = None
+            self.cand_img_enc  = None
+
+        elif pipeline == "text":
+            self.cand_text_enc = (
+                self.ctx_enc if mcfg.shared_encoder
+                else self._make_text_enc(mcfg, vocab_size, freeze)
+            )
+            self.cand_img_enc  = None
+            cand_dim = self.cand_text_enc.out_dim
+
+        elif pipeline == "image":
+            self.cand_img_enc  = _CLIPImageEncoder(mcfg.clip_model_name, freeze)
+            self.cand_text_enc = None
+            cand_dim = self.cand_img_enc.out_dim
+
+        else:  # multimodal (non-LLaVA): fuse image + text
+            self.cand_img_enc  = _CLIPImageEncoder(mcfg.clip_model_name, freeze)
+            self.cand_text_enc = (
+                self.ctx_enc if mcfg.shared_encoder
+                else self._make_text_enc(mcfg, vocab_size, freeze)
+            )
+            fuse_in  = self.cand_img_enc.out_dim + self.cand_text_enc.out_dim
+            proj_dim = mcfg.proj_dim if mcfg.proj_dim > 0 else fuse_in
+            self.fusion = nn.Linear(fuse_in, proj_dim)
+            cand_dim = proj_dim
+
+        ctx_dim  = self.ctx_enc.out_dim
+        proj_dim = mcfg.proj_dim if mcfg.proj_dim > 0 else max(ctx_dim, cand_dim)
+
+        if mcfg.ranker_type == "similarity":
+            self.ranker = _SimilarityRanker(
+                ctx_dim, cand_dim, proj_dim,
+                sim_fn  = mcfg.similarity_fn,
+                dropout = mcfg.dropout,
+            )
         else:
-            raise ValueError(f"Unsupported similarity_type: {self.config.model.similarity_type}")
-
-        return scores.masked_fill(batch.candidate_mask <= 0, -1e9)
-
-
-class PreferenceRanker(nn.Module):
-    def __init__(self, config: Config, vocab_size: int, pad_idx: int) -> None:
-        super().__init__()
-        self.config = config
-        self.context_encoder = TextEncoder(
-            vocab_size=vocab_size,
-            pad_idx=pad_idx,
-            text_encoder_type=config.model.text_encoder_type,
-            embed_dim=config.model.embed_dim,
-            hidden_dim=config.model.hidden_dim,
-            dropout=config.model.dropout,
-        )
-        if config.model.use_shared_encoder:
-            self.candidate_encoder = self.context_encoder
-        else:
-            self.candidate_encoder = TextEncoder(
-                vocab_size=vocab_size,
-                pad_idx=pad_idx,
-                text_encoder_type=config.model.text_encoder_type,
-                embed_dim=config.model.embed_dim,
-                hidden_dim=config.model.hidden_dim,
-                dropout=config.model.dropout,
+            self.ranker = _PreferenceRanker(
+                ctx_dim, cand_dim, proj_dim,
+                mlp_hidden = mcfg.mlp_hidden,
+                dropout    = mcfg.dropout,
             )
 
-        feature_dim = self.context_encoder.output_dim * 4
-        hidden_dim = config.model.hidden_dim
-        self.scorer = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(config.model.dropout),
-            nn.Linear(hidden_dim, 1),
-        )
+
+    @staticmethod
+    def _make_text_enc(mcfg, vocab_size: int, freeze: bool) -> nn.Module:
+        enc = mcfg.encoder_type
+        if enc == "hf":
+            return _HFTextEncoder(mcfg.hf_model_name, freeze)
+        elif enc == "clip":
+            return _CLIPTextEncoder(mcfg.clip_model_name, freeze)
+        elif enc == "bow_mean":
+            return _BOWEncoder(vocab_size, mcfg.embed_dim)
+        elif enc == "gru":
+            return _GRUEncoder(vocab_size, mcfg.embed_dim, mcfg.hidden_dim)
+        elif enc == "qwen_vl":
+            raise ValueError("Qwen2.5-VL is only supported as an image/multimodal cross-encoder.")
+        elif enc == "llava":
+            return _CLIPTextEncoder(mcfg.clip_model_name, freeze)
+        raise ValueError(f"Unknown encoder_type: {enc!r}")
+
+
+    def _encode_context(self, batch: Batch) -> torch.Tensor:
+        return self.ctx_enc(batch.context_input_ids, batch.context_attention_mask)
+
+    def _encode_candidates(self, batch: Batch) -> torch.Tensor:
+        B, K = batch.ranks.shape
+
+        if self.is_llava:
+            flat_ids  = batch.candidate_input_ids.view(B * K, -1)
+            flat_mask = batch.candidate_attention_mask.view(B * K, -1)
+            flat_pv   = batch.pixel_values.view(B * K, *batch.pixel_values.shape[2:])
+            emb = self.llava_enc(flat_ids, flat_mask, flat_pv)   # [B*K, D]
+            return emb.view(B, K, -1)
+
+        if self.pipeline == "text":
+            flat_ids  = batch.candidate_input_ids.view(B * K, -1)
+            flat_mask = batch.candidate_attention_mask.view(B * K, -1)
+            emb = self.cand_text_enc(flat_ids, flat_mask)
+            return emb.view(B, K, -1)
+
+        if self.pipeline == "image":
+            flat_pv = batch.pixel_values.view(B * K, *batch.pixel_values.shape[2:])
+            emb = self.cand_img_enc(flat_pv)
+            return emb.view(B, K, -1)
+
+        # multimodal (non-LLaVA): fuse
+        flat_ids  = batch.candidate_input_ids.view(B * K, -1)
+        flat_mask = batch.candidate_attention_mask.view(B * K, -1)
+        flat_pv   = batch.pixel_values.view(B * K, *batch.pixel_values.shape[2:])
+        text_emb  = self.cand_text_enc(flat_ids, flat_mask)
+        img_emb   = self.cand_img_enc(flat_pv)
+        fused     = self.fusion(torch.cat([text_emb, img_emb], dim=-1))
+        return fused.view(B, K, -1)
 
     def forward(self, batch: Batch) -> torch.Tensor:
-        batch_size, num_candidates, candidate_len = batch.candidate_input_ids.shape
-        context_embeddings = self.context_encoder(batch.context_input_ids, batch.context_attention_mask)
-        flat_candidate_ids = batch.candidate_input_ids.view(batch_size * num_candidates, candidate_len)
-        flat_candidate_mask = batch.candidate_attention_mask.view(batch_size * num_candidates, candidate_len)
-        candidate_embeddings = self.candidate_encoder(flat_candidate_ids, flat_candidate_mask)
-        candidate_embeddings = candidate_embeddings.view(batch_size, num_candidates, -1)
+        if self.is_qwen_vl:
+            B, K = batch.ranks.shape
+            flat_ids  = batch.candidate_input_ids.view(B * K, -1)
+            flat_mask = batch.candidate_attention_mask.view(B * K, -1)
+            flat_pv   = batch.pixel_values.view(B * K, *batch.pixel_values.shape[2:])
+            flat_grid = batch.image_grid_thw.view(B * K, -1)
+            emb = self.qwen_pair_enc(flat_ids, flat_mask, flat_pv, flat_grid)
+            scores = self.pair_scorer(self.pair_proj(emb)).view(B, K)
+            return scores.masked_fill(batch.candidate_mask <= 0, -1e9)
 
-        expanded_context = context_embeddings.unsqueeze(1).expand_as(candidate_embeddings)
-        features = torch.cat(
-            [
-                expanded_context,
-                candidate_embeddings,
-                torch.abs(expanded_context - candidate_embeddings),
-                expanded_context * candidate_embeddings,
-            ],
-            dim=-1,
-        )
-        scores = self.scorer(features).squeeze(-1)
-        return scores.masked_fill(batch.candidate_mask <= 0, -1e9)
+        ctx  = self._encode_context(batch)     # [B, D]
+        cand = self._encode_candidates(batch)  # [B, K, D']
+        return self.ranker(ctx, cand)          # [B, K]
 
 
-def build_model(config: Config, vocab_size: int) -> nn.Module:
-    pad_idx = 0
-    if config.model.model_type == "similarity":
-        return SimilarityRanker(config, vocab_size=vocab_size, pad_idx=pad_idx)
-    if config.model.model_type == "preference":
-        return PreferenceRanker(config, vocab_size=vocab_size, pad_idx=pad_idx)
-    raise ValueError(f"Unsupported model_type: {config.model.model_type}")
+def build_model(config, vocab_size: int = 2) -> MemeRanker:
+    model  = MemeRanker(config, vocab_size=vocab_size)
+    total  = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(
+        f"[Model] pipeline={config.model.pipeline}  "
+        f"encoder={config.model.encoder_type}  "
+        f"ranker={config.model.ranker_type}  "
+        f"params={total:,}  trainable={trainable:,}"
+    )
+    return model

@@ -5,65 +5,57 @@ import torch.nn.functional as F
 
 from dataset import Batch
 
+_PAD_RANK = 10_000   # sentinel rank assigned to padding slots in the batch
 
-def pairwise_hinge_loss(
+
+def _valid_pairs(ranks: torch.Tensor, cand_mask: torch.Tensor):
+    rank_i = ranks.unsqueeze(2)       # [B, K, 1]
+    rank_j = ranks.unsqueeze(1)       # [B, 1, K]
+    mask_i = cand_mask.unsqueeze(2).bool()
+    mask_j = cand_mask.unsqueeze(1).bool()
+    return (rank_i < rank_j) & mask_i & mask_j   # [B, K, K]
+
+
+def _bpr_loss(scores: torch.Tensor, ranks: torch.Tensor, cand_mask: torch.Tensor) -> torch.Tensor:
+    score_i = scores.unsqueeze(2)   # [B, K, 1]
+    score_j = scores.unsqueeze(1)   # [B, 1, K]
+    valid   = _valid_pairs(ranks, cand_mask).float()
+    per_pair = -F.logsigmoid(score_i - score_j)
+    denom    = valid.sum().clamp(min=1.0)
+    return (per_pair * valid).sum() / denom
+
+
+def _hinge_loss(
     scores: torch.Tensor,
-    ranks: torch.Tensor,
-    candidate_mask: torch.Tensor,
+    ranks:  torch.Tensor,
+    cand_mask: torch.Tensor,
     margin: float = 1.0,
 ) -> torch.Tensor:
-    total_loss = scores.new_tensor(0.0)
-    total_pairs = 0
-
-    for task_scores, task_ranks, task_mask in zip(scores, ranks, candidate_mask):
-        valid = task_mask > 0
-        valid_scores = task_scores[valid]
-        valid_ranks = task_ranks[valid]
-        if valid_scores.numel() < 2:
-            continue
-
-        preferred = valid_ranks.unsqueeze(1) < valid_ranks.unsqueeze(0)
-        if not preferred.any():
-            continue
-
-        pairwise_margin = margin - (valid_scores.unsqueeze(1) - valid_scores.unsqueeze(0))
-        loss_matrix = F.relu(pairwise_margin)
-        total_loss = total_loss + loss_matrix[preferred].sum()
-        total_pairs += int(preferred.sum().item())
-
-    if total_pairs == 0:
-        return scores.new_tensor(0.0)
-    return total_loss / total_pairs
+    score_i = scores.unsqueeze(2)
+    score_j = scores.unsqueeze(1)
+    valid   = _valid_pairs(ranks, cand_mask).float()
+    per_pair = F.relu(margin - (score_i - score_j))
+    denom    = valid.sum().clamp(min=1.0)
+    return (per_pair * valid).sum() / denom
 
 
-def bpr_loss(scores: torch.Tensor, ranks: torch.Tensor, candidate_mask: torch.Tensor) -> torch.Tensor:
-    total_loss = scores.new_tensor(0.0)
-    total_pairs = 0
+def compute_loss(
+    scores:    torch.Tensor,   # [B, K]  model output
+    batch:     Batch,
+    loss_type: str = "bpr",
+    margin:    float = 1.0,
+) -> torch.Tensor:
+    """
+    Entry point called by train.py:
 
-    for task_scores, task_ranks, task_mask in zip(scores, ranks, candidate_mask):
-        valid = task_mask > 0
-        valid_scores = task_scores[valid]
-        valid_ranks = task_ranks[valid]
-        if valid_scores.numel() < 2:
-            continue
+        loss = compute_loss(scores, batch, config.train.loss_type)
+    """
+    ranks      = batch.ranks           # [B, K]
+    cand_mask  = batch.candidate_mask  # [B, K]  1=real, 0=pad
 
-        preferred = valid_ranks.unsqueeze(1) < valid_ranks.unsqueeze(0)
-        if not preferred.any():
-            continue
-
-        score_diff = valid_scores.unsqueeze(1) - valid_scores.unsqueeze(0)
-        loss_matrix = -F.logsigmoid(score_diff)
-        total_loss = total_loss + loss_matrix[preferred].sum()
-        total_pairs += int(preferred.sum().item())
-
-    if total_pairs == 0:
-        return scores.new_tensor(0.0)
-    return total_loss / total_pairs
-
-
-def compute_loss(scores: torch.Tensor, batch: Batch, loss_type: str) -> torch.Tensor:
-    if loss_type == "hinge":
-        return pairwise_hinge_loss(scores=scores, ranks=batch.ranks, candidate_mask=batch.candidate_mask)
     if loss_type == "bpr":
-        return bpr_loss(scores=scores, ranks=batch.ranks, candidate_mask=batch.candidate_mask)
-    raise ValueError(f"Unsupported loss_type: {loss_type}")
+        return _bpr_loss(scores, ranks, cand_mask)
+    elif loss_type == "hinge":
+        return _hinge_loss(scores, ranks, cand_mask, margin=margin)
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type!r}. Use 'bpr' or 'hinge'.")

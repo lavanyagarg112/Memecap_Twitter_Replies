@@ -1,66 +1,69 @@
+"""
+  python eval.py --checkpoint checkpoints/best.pt --split test
+  python eval.py --checkpoint checkpoints/best.pt --split val
+"""
+
 from __future__ import annotations
 
 import argparse
-from dataclasses import fields
 
 import torch
 from torch.utils.data import DataLoader
 
-from config import Config, parse_args
-from dataset import collate_fn, load_datasets
-from train import _resolve_device, evaluate
+from config import Config
+from dataset import load_datasets, make_collate_fn, MemeDataset
+from dataset import _load_tasks
 from model import build_model
+from train import evaluate, _resolve_device, _format_metrics
 from utils import load_checkpoint
-
-
-def _apply_checkpoint_config(config: Config, checkpoint_config: dict) -> Config:
-    if not checkpoint_config:
-        return config
-
-    for section_name in ("data", "text", "model", "train", "eval"):
-        section = getattr(config, section_name)
-        section_values = checkpoint_config.get(section_name, {})
-        valid_names = {field.name for field in fields(section)}
-        for key, value in section_values.items():
-            if key in valid_names:
-                setattr(section, key, value)
-    return config
+from text_utils import Vocab
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate a trained meme reply ranking model.")
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--split", type=str, choices=["val", "test"], default="test")
-    args, remaining = parser.parse_known_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--split",  default="test", choices=["val", "test"])
+    p.add_argument("--device", default="cuda")
+    args = p.parse_args()
 
-    import sys
+    device = _resolve_device(args.device)
 
-    original_argv = sys.argv
-    sys.argv = [original_argv[0]] + remaining
-    config = parse_args()
-    sys.argv = original_argv
+    raw   = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    cfg   = Config.from_dict(raw["config"])
+    vocab = Vocab.from_state_dict(raw["vocab"])
 
-    checkpoint_meta = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    config = _apply_checkpoint_config(config, checkpoint_meta.get("config", {}))
+    model = build_model(cfg, vocab_size=len(vocab)).to(device)
+    load_checkpoint(args.checkpoint, model, map_location=device)
 
-    train_dataset, val_dataset, test_dataset, vocab = load_datasets(config)
-    target_dataset = val_dataset if args.split == "val" else test_dataset
-    dataloader = DataLoader(
-        target_dataset,
-        batch_size=config.train.batch_size,
-        shuffle=False,
-        num_workers=config.train.num_workers,
-        collate_fn=collate_fn,
+    from dataset import _build_processors
+    tokenizer, image_processor = _build_processors(cfg)
+
+    csv_path = cfg.data.val_csv if args.split == "val" else cfg.data.test_csv
+    tasks = _load_tasks(csv_path, cfg.data.candidate_text_fields)
+    ds    = MemeDataset(
+        tasks          = tasks,
+        pipeline       = cfg.model.pipeline,
+        image_dir      = cfg.data.image_dir,
+        min_candidates = cfg.data.min_candidates_per_task,
+    )
+    collate = make_collate_fn(
+        pipeline        = cfg.model.pipeline,
+        encoder_type    = cfg.model.encoder_type,
+        tokenizer       = tokenizer,
+        image_processor = image_processor,
+        vocab           = vocab,
+        text_cfg        = cfg.text,
+    )
+    loader = DataLoader(
+        ds,
+        batch_size  = cfg.train.batch_size,
+        shuffle     = False,
+        num_workers = cfg.train.num_workers,
+        collate_fn  = collate,
     )
 
-    device = _resolve_device(config.train.device)
-    model = build_model(config, vocab_size=len(vocab)).to(device)
-    load_checkpoint(args.checkpoint, model, map_location=device)
-    metrics = evaluate(model, dataloader, device, config)
-
-    print(f"Split={args.split}")
-    for key, value in metrics.items():
-        print(f"{key}: {value:.4f}")
+    metrics = evaluate(model, loader, device, cfg)
+    print(_format_metrics(f"{args.split.upper()} [{args.checkpoint}]", metrics))
 
 
 if __name__ == "__main__":
