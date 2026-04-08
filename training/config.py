@@ -94,6 +94,7 @@ class TrainConfig:
     num_workers: int  = 2
     use_amp:     bool = True      # mixed precision, CUDA only
     save_dir:  str = "checkpoints"
+    resume_from: str = ""
     log_every: int = 50
 
 
@@ -166,6 +167,8 @@ def parse_args() -> Config:
     parser.add_argument("--device",        default=cfg.train.device)
     parser.add_argument("--seed",          type=int,   default=cfg.train.seed)
     parser.add_argument("--save_dir",      default=cfg.train.save_dir)
+    parser.add_argument("--resume",        nargs="?", const="auto", default=cfg.train.resume_from,
+                   help="Resume from a checkpoint path. Pass without a value to use <save_dir>/latest.pt.")
     parser.add_argument("--num_workers",   type=int,   default=cfg.train.num_workers)
     parser.add_argument("--no_amp",        action="store_true",
                    help="Disable mixed-precision training.")
@@ -201,6 +204,7 @@ def parse_args() -> Config:
     cfg.train.device       = args.device
     cfg.train.seed         = args.seed
     cfg.train.save_dir     = args.save_dir
+    cfg.train.resume_from  = args.resume
     cfg.train.num_workers  = args.num_workers
     cfg.train.use_amp      = not args.no_amp
 

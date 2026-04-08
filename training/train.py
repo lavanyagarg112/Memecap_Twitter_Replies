@@ -36,6 +36,7 @@ from utils import (
     ensure_dir,
     load_checkpoint,
     move_batch_to_device,
+    restore_rng_state,
     save_checkpoint,
     set_seed,
 )
@@ -62,6 +63,39 @@ def _make_scheduler(optimizer, config, steps_per_epoch: int):
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     else:
         return torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.95)
+
+
+def _resolve_resume_path(config, latest_path: str) -> str | None:
+    resume = config.train.resume_from
+    if not resume:
+        return None
+    return latest_path if resume == "auto" else resume
+
+
+def _resume_training_state(model, optimizer, scheduler, device, config, latest_path: str):
+    resume_path = _resolve_resume_path(config, latest_path)
+    if resume_path is None:
+        return 1, float("-inf"), None
+    if not os.path.exists(resume_path):
+        raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+
+    checkpoint = load_checkpoint(
+        resume_path,
+        model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        map_location=device,
+    )
+    restore_rng_state(checkpoint.get("rng_state"))
+
+    last_epoch = int(checkpoint.get("epoch", 0))
+    start_epoch = last_epoch + 1
+    best_score = float(checkpoint.get("best_metric", float("-inf")))
+    print(
+        f"Resumed training from {resume_path} "
+        f"(last_epoch={last_epoch}, next_epoch={start_epoch}, best_recall_at_1={best_score:.4f})"
+    )
+    return start_epoch, best_score, resume_path
 
 
 def train_one_epoch(model, dataloader, optimizer, scheduler, device, config) -> dict:
@@ -182,10 +216,18 @@ def main() -> None:
     latest_path = os.path.join(config.train.save_dir, "latest.pt")
     best_path   = os.path.join(config.train.save_dir, "best.pt")
     # Primary metric: recall_at_1 (rank-based; no avg_score in the dataset)
-    best_score  = float("-inf")
+    start_epoch, best_score, resume_path = _resume_training_state(
+        model, optimizer, scheduler, device, config, latest_path
+    )
 
     # ── training loop ─────────────────────────────────────────────────────────
-    for epoch in range(1, config.train.num_epochs + 1):
+    if start_epoch > config.train.num_epochs:
+        print(
+            f"Resume checkpoint already reached epoch {start_epoch - 1}, "
+            f"which is >= requested num_epochs={config.train.num_epochs}. Skipping training."
+        )
+
+    for epoch in range(start_epoch, config.train.num_epochs + 1):
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, scheduler, device, config
         )
@@ -193,18 +235,6 @@ def main() -> None:
 
         print(_format_metrics(f"Epoch {epoch} Train", train_metrics))
         print(_format_metrics(f"Epoch {epoch} Val",   val_metrics))
-
-        # Save latest every epoch
-        save_checkpoint(
-            latest_path,
-            model        = model,
-            optimizer    = optimizer,
-            scheduler    = scheduler,
-            epoch        = epoch,
-            config       = config,
-            vocab        = vocab,
-            best_metric  = best_score,
-        )
 
         # Save best when recall_at_1 improves
         current_score = val_metrics.get("recall_at_1", float("-inf"))
@@ -222,10 +252,24 @@ def main() -> None:
             )
             print(f"  ★ New best  recall_at_1={best_score:.4f}  → {best_path}")
 
-    print("\nLoading best checkpoint for test evaluation...")
-    load_checkpoint(best_path, model, map_location=device)
+        # Save latest every epoch after updating best_score
+        save_checkpoint(
+            latest_path,
+            model        = model,
+            optimizer    = optimizer,
+            scheduler    = scheduler,
+            epoch        = epoch,
+            config       = config,
+            vocab        = vocab,
+            best_metric  = best_score,
+        )
+
+    eval_path = best_path if os.path.exists(best_path) else (resume_path or latest_path)
+    print(f"\nLoading checkpoint for test evaluation: {eval_path}")
+    load_checkpoint(eval_path, model, map_location=device)
     test_metrics = evaluate(model, test_loader, device, config)
-    print(_format_metrics("Best Checkpoint Test", test_metrics))
+    label = "Best Checkpoint Test" if eval_path == best_path else "Latest Checkpoint Test"
+    print(_format_metrics(label, test_metrics))
 
 
 if __name__ == "__main__":

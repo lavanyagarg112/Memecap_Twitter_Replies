@@ -77,7 +77,7 @@ def _build_qwen_pair_prompt(
     if candidate_text.strip():
         prompt.append(f"Candidate meme text:\n{candidate_text}")
         prompt.append(
-            "How suitable is this meme image and text together as a reply to the tweet?"
+            "How suitable is this meme image as a reply to the tweet?"
         )
     else:
         prompt.append("How suitable is this meme image as a reply to the tweet?")

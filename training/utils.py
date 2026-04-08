@@ -24,6 +24,27 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def capture_rng_state() -> dict:
+    state = {
+        "python": random.getstate(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: Optional[dict]) -> None:
+    if not state:
+        return
+    if "python" in state:
+        random.setstate(state["python"])
+    if "torch" in state:
+        torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
 def move_batch_to_device(batch: Batch, device: torch.device) -> Batch:
     def _m(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         return t.to(device) if t is not None else None
@@ -56,6 +77,7 @@ def save_checkpoint(
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "epoch":                epoch,
         "best_metric":          best_metric,
+        "rng_state":            capture_rng_state(),
         "config":               asdict(config) if is_dataclass(config) else config,
         "vocab":                vocab.state_dict(),
     }

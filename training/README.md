@@ -276,6 +276,40 @@ Each run saves:
 - `latest.pt`
 - `best.pt`
 
+To resume a run from the last completed epoch in the same save directory:
+
+```bash
+python training/train.py \
+  --pipeline text \
+  --encoder_type hf \
+  --device cuda \
+  --save_dir training/checkpoints/text_hf_clean \
+  --resume
+```
+
+To resume from an explicit checkpoint path:
+
+```bash
+python training/train.py \
+  --pipeline image \
+  --encoder_type qwen_vl \
+  --device cuda \
+  --batch_size 1 \
+  --freeze_encoder \
+  --image_dir training/data/non-annotation-dataset/images \
+  --save_dir training/checkpoints/image_qwen_clean \
+  --resume training/checkpoints/image_qwen_clean/latest.pt
+```
+
+Resume restores:
+
+- model weights
+- optimizer state
+- scheduler state
+- RNG state
+
+Resume continues from the next epoch after the saved checkpoint. It does not resume from the middle of an epoch.
+
 Checkpoints include:
 
 - model weights
