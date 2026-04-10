@@ -52,7 +52,8 @@ class Batch:
     context_attention_mask : [B, Lc]
     candidate_input_ids    : [B, K, Lm]      candidate text token ids   (None = image-only)
     candidate_attention_mask: [B, K, Lm]                                (None = image-only)
-    pixel_values           : [B, K, C, H, W] candidate images           (None = text-only)
+    pixel_values           : [B, K, C, H, W] candidate images for non-Qwen image paths
+                           : [sum(image_patches), patch_dim] for Qwen-VL
     candidate_mask         : [B, K]          1 = real candidate, 0 = pad slot
     ranks                  : [B, K]          int  1 = best, higher = worse
     task_ids               : List[str]       length B
@@ -270,11 +271,9 @@ def make_collate_fn(
             )
             cand_ids  = out["input_ids"].view(B, K, -1)
             cand_attn = out["attention_mask"].view(B, K, -1)
-            pv = out["pixel_values"]
-            pixel_values = pv.view(B, K, *pv.shape[1:])
+            pixel_values = out["pixel_values"]
             if "image_grid_thw" in out:
-                grid = out["image_grid_thw"]
-                image_grid_thw = grid.view(B, K, -1)
+                image_grid_thw = out["image_grid_thw"]
 
         elif need_text and tokenizer is not None:
             # HuggingFace tokenizer (AutoTokenizer or CLIPProcessor)

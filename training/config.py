@@ -93,6 +93,7 @@ class TrainConfig:
     seed:        int  = 42
     num_workers: int  = 2
     use_amp:     bool = True      # mixed precision, CUDA only
+    amp_dtype:   str  = "auto"    # "auto" | "fp16" | "bf16"
     save_dir:  str = "checkpoints"
     resume_from: str = ""
     log_every: int = 50
@@ -172,6 +173,9 @@ def parse_args() -> Config:
     parser.add_argument("--num_workers",   type=int,   default=cfg.train.num_workers)
     parser.add_argument("--no_amp",        action="store_true",
                    help="Disable mixed-precision training.")
+    parser.add_argument("--amp_dtype",     default=cfg.train.amp_dtype,
+                   choices=["auto", "fp16", "bf16"],
+                   help="CUDA autocast dtype. 'auto' uses bf16 for Qwen when supported, otherwise fp16.")
 
     parser.add_argument("--ndcg_k", type=int, default=cfg.eval.ndcg_k)
     args = parser.parse_args()
@@ -207,6 +211,7 @@ def parse_args() -> Config:
     cfg.train.resume_from  = args.resume
     cfg.train.num_workers  = args.num_workers
     cfg.train.use_amp      = not args.no_amp
+    cfg.train.amp_dtype    = args.amp_dtype
 
     cfg.eval.ndcg_k = args.ndcg_k
 

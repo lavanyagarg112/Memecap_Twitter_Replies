@@ -56,6 +56,74 @@ python training/train.py --pipeline image --encoder_type qwen_vl --device cuda -
 python training/train.py --pipeline multimodal --encoder_type qwen_vl --device cuda --batch_size 1 --freeze_encoder --image_dir training/data/non-annotation-dataset/images --save_dir training/checkpoints/multimodal_qwen_clean
 ```
 
+Or run the main three pipelines sequentially with automatic resume:
+
+```bash
+bash training/run_all_pipelines.sh
+```
+
+For 1-epoch smoke tests with the same resume behavior:
+
+```bash
+bash training/run_all_pipelines.sh --smoke
+```
+
+## Modal
+
+If you want to run the pipelines on Modal instead of your local machine, use
+`training/modal_app.py`.
+
+1. Install Modal locally:
+
+```bash
+pip install modal
+modal setup
+```
+
+2. Upload your downloaded meme images into the Modal volume:
+
+```bash
+modal run training/modal_app.py::sync_images --local-dir training/data/non-annotation-dataset/images
+```
+
+3. Run the full training sequence on Modal with resume-aware behavior:
+
+```bash
+modal run training/modal_app.py::train
+```
+
+4. Run a smoke test on Modal:
+
+```bash
+modal run training/modal_app.py::train --mode smoke
+```
+
+Useful variants:
+
+```bash
+modal run training/modal_app.py::train --pipelines text
+```
+
+```bash
+modal run training/modal_app.py::train --pipelines image,multimodal
+```
+
+```bash
+modal run training/modal_app.py::train --num-epochs 20
+```
+
+The Modal app uses three persistent volumes:
+
+- `cs4248-meme-images`
+- `cs4248-meme-checkpoints`
+- `cs4248-hf-cache`
+
+To download checkpoints back to your machine:
+
+```bash
+modal volume get cs4248-meme-checkpoints / training/modal_checkpoints
+```
+
 5. Evaluate the best checkpoint:
 
 ```bash

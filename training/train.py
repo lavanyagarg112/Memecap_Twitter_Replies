@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 
@@ -72,21 +73,43 @@ def _resolve_resume_path(config, latest_path: str) -> str | None:
     return latest_path if resume == "auto" else resume
 
 
-def _resume_training_state(model, optimizer, scheduler, device, config, latest_path: str):
+def _resume_training_state(model, optimizer, scheduler, device, config, latest_path: str, best_path: str):
     resume_path = _resolve_resume_path(config, latest_path)
     if resume_path is None:
         return 1, float("-inf"), None
     if not os.path.exists(resume_path):
         raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
 
-    checkpoint = load_checkpoint(
-        resume_path,
-        model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        map_location=device,
-    )
-    restore_rng_state(checkpoint.get("rng_state"))
+    try:
+        checkpoint = load_checkpoint(
+            resume_path,
+            model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            map_location=device,
+        )
+        restore_rng_state(checkpoint.get("rng_state"))
+    except Exception as exc:
+        can_fallback = (
+            resume_path == latest_path
+            and os.path.exists(best_path)
+            and best_path != latest_path
+        )
+        if not can_fallback:
+            raise
+        print(
+            f"Warning: failed to resume from {resume_path}: {exc}. "
+            f"Falling back to {best_path}."
+        )
+        checkpoint = load_checkpoint(
+            best_path,
+            model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            map_location=device,
+        )
+        restore_rng_state(checkpoint.get("rng_state"))
+        resume_path = best_path
 
     last_epoch = int(checkpoint.get("epoch", 0))
     start_epoch = last_epoch + 1
@@ -98,28 +121,89 @@ def _resume_training_state(model, optimizer, scheduler, device, config, latest_p
     return start_epoch, best_score, resume_path
 
 
-def train_one_epoch(model, dataloader, optimizer, scheduler, device, config) -> dict:
+def _resolve_amp_settings(config, device: torch.device) -> tuple[bool, torch.dtype | None, bool]:
+    if device.type != "cuda" or not config.train.use_amp:
+        return False, None, False
+
+    amp_dtype = config.train.amp_dtype
+    if amp_dtype == "auto":
+        if config.model.encoder_type == "qwen_vl" and torch.cuda.is_bf16_supported():
+            return True, torch.bfloat16, False
+        return True, torch.float16, True
+    if amp_dtype == "bf16":
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("bf16 autocast requested, but this CUDA device does not support bf16.")
+        return True, torch.bfloat16, False
+    return True, torch.float16, True
+
+
+def _amp_context(enabled: bool, amp_dtype: torch.dtype | None):
+    if not enabled:
+        return contextlib.nullcontext()
+    return torch.amp.autocast("cuda", dtype=amp_dtype)
+
+
+def _assert_finite(name: str, tensor: torch.Tensor, batch, *, step: int, epoch: int) -> None:
+    if torch.isfinite(tensor).all():
+        return
+
+    detached = tensor.detach().float()
+    finite = detached[torch.isfinite(detached)]
+    stats = (
+        f"finite_min={finite.min().item():.4f}, finite_max={finite.max().item():.4f}"
+        if finite.numel() > 0
+        else "no finite values"
+    )
+    sample_task_ids = ",".join(batch.task_ids[:3])
+    raise FloatingPointError(
+        f"Non-finite {name} detected at epoch={epoch} step={step} "
+        f"pipeline_batch_tasks={sample_task_ids} shape={tuple(tensor.shape)} {stats}"
+    )
+
+
+def train_one_epoch(model, dataloader, optimizer, scheduler, device, config, epoch: int) -> dict:
     model.train()
     loss_meter    = AverageMeter()
     metric_meters: dict[str, AverageMeter] = {}
 
-    use_amp = config.train.use_amp and device.type == "cuda"
-    scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
+    use_amp, amp_dtype, use_scaler = _resolve_amp_settings(config, device)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler) if device.type == "cuda" else None
 
-    for batch in dataloader:
+    for step_idx, batch in enumerate(dataloader, start=1):
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast("cuda", enabled=use_amp):
+        with _amp_context(use_amp, amp_dtype):
             scores = model(batch)
-            loss   = compute_loss(scores, batch, config.train.loss_type)
+            loss   = compute_loss(
+                scores,
+                batch,
+                config.train.loss_type,
+                margin=config.train.hinge_margin,
+            )
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        _assert_finite("scores", scores, batch, step=step_idx, epoch=epoch)
+        _assert_finite("loss", loss, batch, step=step_idx, epoch=epoch)
+
+        if scaler is not None and use_scaler:
+            scale_before = scaler.get_scale()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+        else:
+            scale_before = None
+            loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_clip_norm)
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
+
+        if scaler is not None and use_scaler:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer_stepped = scaler.get_scale() >= scale_before
+        else:
+            optimizer.step()
+            optimizer_stepped = True
+
+        if optimizer_stepped:
+            scheduler.step()
 
         batch_size = len(batch.task_ids)
         loss_meter.update(float(loss.item()), batch_size)
@@ -136,15 +220,25 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device, config) -> 
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, config) -> dict:
+def evaluate(model, dataloader, device, config, epoch: int | None = None) -> dict:
     model.eval()
     loss_meter    = AverageMeter()
     metric_meters: dict[str, AverageMeter] = {}
+    use_amp, amp_dtype, _ = _resolve_amp_settings(config, device)
 
-    for batch in dataloader:
+    for step_idx, batch in enumerate(dataloader, start=1):
         batch  = move_batch_to_device(batch, device)
-        scores = model(batch)
-        loss   = compute_loss(scores, batch, config.train.loss_type)
+        with _amp_context(use_amp, amp_dtype):
+            scores = model(batch)
+            loss   = compute_loss(
+                scores,
+                batch,
+                config.train.loss_type,
+                margin=config.train.hinge_margin,
+            )
+
+        _assert_finite("eval_scores", scores, batch, step=step_idx, epoch=epoch or 0)
+        _assert_finite("eval_loss", loss, batch, step=step_idx, epoch=epoch or 0)
 
         batch_size = len(batch.task_ids)
         loss_meter.update(float(loss.item()), batch_size)
@@ -217,7 +311,7 @@ def main() -> None:
     best_path   = os.path.join(config.train.save_dir, "best.pt")
     # Primary metric: recall_at_1 (rank-based; no avg_score in the dataset)
     start_epoch, best_score, resume_path = _resume_training_state(
-        model, optimizer, scheduler, device, config, latest_path
+        model, optimizer, scheduler, device, config, latest_path, best_path
     )
 
     # ── training loop ─────────────────────────────────────────────────────────
@@ -229,9 +323,9 @@ def main() -> None:
 
     for epoch in range(start_epoch, config.train.num_epochs + 1):
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, scheduler, device, config
+            model, train_loader, optimizer, scheduler, device, config, epoch
         )
-        val_metrics = evaluate(model, val_loader, device, config)
+        val_metrics = evaluate(model, val_loader, device, config, epoch=epoch)
 
         print(_format_metrics(f"Epoch {epoch} Train", train_metrics))
         print(_format_metrics(f"Epoch {epoch} Val",   val_metrics))

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import random
+import tempfile
+import warnings
 from dataclasses import asdict, is_dataclass
 from typing import Optional
 
@@ -40,9 +42,42 @@ def restore_rng_state(state: Optional[dict]) -> None:
     if "python" in state:
         random.setstate(state["python"])
     if "torch" in state:
-        torch.set_rng_state(state["torch"])
+        torch_state = state["torch"]
+        if not isinstance(torch_state, torch.Tensor):
+            try:
+                torch_state = torch.tensor(torch_state, dtype=torch.uint8)
+            except Exception:
+                warnings.warn("Skipping invalid CPU RNG state in checkpoint resume.")
+                torch_state = None
+        elif torch_state.dtype != torch.uint8:
+            torch_state = torch_state.to(dtype=torch.uint8)
+        if torch_state is not None:
+            try:
+                torch.set_rng_state(torch_state.cpu())
+            except Exception:
+                warnings.warn("Skipping malformed CPU RNG state in checkpoint resume.")
     if torch.cuda.is_available() and "cuda" in state:
-        torch.cuda.set_rng_state_all(state["cuda"])
+        cuda_state = state["cuda"]
+        if isinstance(cuda_state, (list, tuple)):
+            normalized = []
+            for item in cuda_state:
+                if not isinstance(item, torch.Tensor):
+                    try:
+                        item = torch.tensor(item, dtype=torch.uint8)
+                    except Exception:
+                        warnings.warn("Skipping invalid CUDA RNG state in checkpoint resume.")
+                        normalized = []
+                        break
+                elif item.dtype != torch.uint8:
+                    item = item.to(dtype=torch.uint8)
+                normalized.append(item.cpu())
+            if normalized:
+                try:
+                    torch.cuda.set_rng_state_all(normalized)
+                except Exception:
+                    warnings.warn("Skipping malformed CUDA RNG state in checkpoint resume.")
+        else:
+            warnings.warn("Skipping malformed CUDA RNG state in checkpoint resume.")
 
 
 def move_batch_to_device(batch: Batch, device: torch.device) -> Batch:
@@ -81,7 +116,15 @@ def save_checkpoint(
         "config":               asdict(config) if is_dataclass(config) else config,
         "vocab":                vocab.state_dict(),
     }
-    torch.save(checkpoint, path)
+    dirpath = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix="tmp_ckpt_", suffix=".pt", dir=dirpath)
+    os.close(fd)
+    try:
+        torch.save(checkpoint, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def load_checkpoint(

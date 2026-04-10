@@ -17,12 +17,12 @@ def _valid_pairs(ranks: torch.Tensor, cand_mask: torch.Tensor):
 
 
 def _bpr_loss(scores: torch.Tensor, ranks: torch.Tensor, cand_mask: torch.Tensor) -> torch.Tensor:
-    score_i = scores.unsqueeze(2)   # [B, K, 1]
-    score_j = scores.unsqueeze(1)   # [B, 1, K]
-    valid   = _valid_pairs(ranks, cand_mask).float()
-    per_pair = -F.logsigmoid(score_i - score_j)
-    denom    = valid.sum().clamp(min=1.0)
-    return (per_pair * valid).sum() / denom
+    valid = _valid_pairs(ranks, cand_mask)   # [B, K, K]
+    diff = (scores.unsqueeze(2) - scores.unsqueeze(1)).float()
+    per_pair = -F.logsigmoid(diff)
+    masked = torch.where(valid, per_pair, torch.zeros_like(per_pair))
+    denom = valid.float().sum().clamp(min=1.0)
+    return masked.sum() / denom
 
 
 def _hinge_loss(
@@ -31,12 +31,12 @@ def _hinge_loss(
     cand_mask: torch.Tensor,
     margin: float = 1.0,
 ) -> torch.Tensor:
-    score_i = scores.unsqueeze(2)
-    score_j = scores.unsqueeze(1)
-    valid   = _valid_pairs(ranks, cand_mask).float()
-    per_pair = F.relu(margin - (score_i - score_j))
-    denom    = valid.sum().clamp(min=1.0)
-    return (per_pair * valid).sum() / denom
+    valid = _valid_pairs(ranks, cand_mask)
+    diff = (scores.unsqueeze(2) - scores.unsqueeze(1)).float()
+    per_pair = F.relu(margin - diff)
+    masked = torch.where(valid, per_pair, torch.zeros_like(per_pair))
+    denom = valid.float().sum().clamp(min=1.0)
+    return masked.sum() / denom
 
 
 def compute_loss(

@@ -136,6 +136,7 @@ class _QwenVLPairEncoder(nn.Module):
     def __init__(self, model_name: str, freeze: bool = False):
         super().__init__()
         from transformers import Qwen2_5_VLForConditionalGeneration
+        self.freeze = freeze
         self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype="auto",
@@ -144,6 +145,13 @@ class _QwenVLPairEncoder(nn.Module):
         if freeze:
             for p in self.model.parameters():
                 p.requires_grad_(False)
+            self.model.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze:
+            self.model.eval()
+        return self
 
     def forward(
         self,
@@ -152,15 +160,21 @@ class _QwenVLPairEncoder(nn.Module):
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        out = self.model(
+        model_kwargs = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
-            output_hidden_states=True,
+            output_hidden_states=False,
+            return_dict=True,
             use_cache=False,
         )
-        last_hidden = out.hidden_states[-1]
+        if self.freeze:
+            with torch.no_grad():
+                out = self.model.model(**model_kwargs)
+        else:
+            out = self.model.model(**model_kwargs)
+        last_hidden = out.last_hidden_state
         seq_lens = attention_mask.sum(1) - 1
         idx = seq_lens.clamp(min=0).unsqueeze(-1).unsqueeze(-1).expand(
             -1, 1, last_hidden.size(-1)
@@ -362,11 +376,13 @@ class MemeRanker(nn.Module):
             B, K = batch.ranks.shape
             flat_ids  = batch.candidate_input_ids.view(B * K, -1)
             flat_mask = batch.candidate_attention_mask.view(B * K, -1)
-            flat_pv   = batch.pixel_values.view(B * K, *batch.pixel_values.shape[2:])
-            flat_grid = batch.image_grid_thw.view(B * K, -1)
-            emb = self.qwen_pair_enc(flat_ids, flat_mask, flat_pv, flat_grid)
-            scores = self.pair_scorer(self.pair_proj(emb)).view(B, K)
-            return scores.masked_fill(batch.candidate_mask <= 0, -1e9)
+            emb = self.qwen_pair_enc(flat_ids, flat_mask, batch.pixel_values, batch.image_grid_thw)
+            if emb.is_cuda:
+                with torch.amp.autocast("cuda", enabled=False):
+                    scores = self.pair_scorer(self.pair_proj(emb.float())).view(B, K)
+            else:
+                scores = self.pair_scorer(self.pair_proj(emb.float())).view(B, K)
+            return scores
 
         ctx  = self._encode_context(batch)     # [B, D]
         cand = self._encode_candidates(batch)  # [B, K, D']
