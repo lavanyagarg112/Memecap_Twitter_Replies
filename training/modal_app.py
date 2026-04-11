@@ -39,6 +39,8 @@ code_image = (
             "**/__pycache__",
             "*.pyc",
             "**/*.pyc",
+            "modal_checkpoints",
+            "modal_checkpoints/**",
             "checkpoints",
             "checkpoints/**",
             "tmp_test_ckpts",

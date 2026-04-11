@@ -241,6 +241,7 @@ class MemeRanker(nn.Module):
         self.enc_type  = enc_type
         self.is_qwen_vl = enc_type == "qwen_vl" and pipeline in ("image", "multimodal")
         self.is_llava  = (enc_type == "llava")
+        self.qwen_pair_chunk_size = 0
 
         if enc_type == "qwen_vl" and pipeline not in ("image", "multimodal"):
             raise ValueError(
@@ -337,6 +338,21 @@ class MemeRanker(nn.Module):
             return _CLIPTextEncoder(mcfg.clip_model_name, freeze)
         raise ValueError(f"Unknown encoder_type: {enc!r}")
 
+    @staticmethod
+    def _slice_qwen_pixel_values(
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor | None,
+        start: int,
+        end: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if image_grid_thw is None:
+            return pixel_values[start:end], None
+
+        prefix_counts = image_grid_thw.prod(dim=1, dtype=torch.long)
+        patch_start = int(prefix_counts[:start].sum().item()) if start > 0 else 0
+        patch_end = patch_start + int(prefix_counts[start:end].sum().item())
+        return pixel_values[patch_start:patch_end], image_grid_thw[start:end]
+
 
     def _encode_context(self, batch: Batch) -> torch.Tensor:
         return self.ctx_enc(batch.context_input_ids, batch.context_attention_mask)
@@ -376,7 +392,28 @@ class MemeRanker(nn.Module):
             B, K = batch.ranks.shape
             flat_ids  = batch.candidate_input_ids.view(B * K, -1)
             flat_mask = batch.candidate_attention_mask.view(B * K, -1)
-            emb = self.qwen_pair_enc(flat_ids, flat_mask, batch.pixel_values, batch.image_grid_thw)
+            chunk_size = int(self.qwen_pair_chunk_size or 0)
+            if chunk_size > 0 and chunk_size < flat_ids.shape[0]:
+                emb_chunks = []
+                for start in range(0, flat_ids.shape[0], chunk_size):
+                    end = min(start + chunk_size, flat_ids.shape[0])
+                    pv_chunk, grid_chunk = self._slice_qwen_pixel_values(
+                        batch.pixel_values,
+                        batch.image_grid_thw,
+                        start,
+                        end,
+                    )
+                    emb_chunks.append(
+                        self.qwen_pair_enc(
+                            flat_ids[start:end],
+                            flat_mask[start:end],
+                            pv_chunk,
+                            grid_chunk,
+                        )
+                    )
+                emb = torch.cat(emb_chunks, dim=0)
+            else:
+                emb = self.qwen_pair_enc(flat_ids, flat_mask, batch.pixel_values, batch.image_grid_thw)
             if emb.is_cuda:
                 with torch.amp.autocast("cuda", enabled=False):
                     scores = self.pair_scorer(self.pair_proj(emb.float())).view(B, K)

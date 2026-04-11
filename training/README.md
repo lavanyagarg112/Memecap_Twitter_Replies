@@ -4,6 +4,9 @@
 
 This training code learns to rerank a fixed set of meme candidates for each tweet.
 
+For the final evaluation summary and a deeper analysis of why the text, image,
+and multimodal pipelines behaved differently, see `training/RESULTS_README.md`.
+
 Each training task is:
 
 - one `tweet_text`
@@ -128,6 +131,44 @@ modal volume get cs4248-meme-checkpoints / training/modal_checkpoints
 
 ```bash
 python training/eval.py --checkpoint training/checkpoints/text_hf_clean/best.pt --split test --device cuda
+```
+
+6. Run evaluation on Modal with the same `training/eval.py` pipeline:
+
+```bash
+modal run training/modal_eval.py::run
+```
+
+This uploads your local:
+
+- `training/modal_checkpoints/text_hf_best.pt`
+- `training/modal_checkpoints/image_qwen_best.pt`
+
+into the Modal checkpoints volume under `training/checkpoints/manual_eval/`, then
+runs both `val` and `test` splits remotely. Multimodal evaluation defaults to the
+checkpoint already present on the Modal account at
+`training/checkpoints/multimodal_qwen_clean/best.pt`.
+
+Useful variants:
+
+```bash
+modal run training/modal_eval.py::run --pipelines text
+```
+
+```bash
+modal run training/modal_eval.py::run --pipelines image,multimodal
+```
+
+```bash
+modal run training/modal_eval.py::run --splits val
+```
+
+```bash
+modal run training/modal_eval.py::sync_checkpoints --force
+```
+
+```bash
+modal run training/modal_eval.py::run --multimodal-checkpoint training/checkpoints/some_other_run/best.pt
 ```
 
 ## Supported Pipelines
